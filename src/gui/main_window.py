@@ -337,6 +337,18 @@ class MainWindow(QMainWindow):
         row.addWidget(self._make_pyro_button("傘 ALL", None, "dpl"))
         row.addWidget(self._make_pyro_button("囊 ALL", None, "abg"))
 
+        row.addWidget(self._vsep())
+        # 校準鈕:火箭端氣壓零點重校(全板)+地面端姿態歸零一鍵完成。
+        # 韌體 IDLE 閘門擋掉飛行中誤按,故單擊即發、不套兩段式紅色確認。
+        cal_btn = QPushButton("校準 ALL")
+        cal_btn.setFixedHeight(26)
+        cal_btn.setStyleSheet(
+            "QPushButton{background:#1B3A4B;color:#7FD4E8;border:1px solid #2E5F73;"
+            "border-radius:4px;padding:2px 10px;}"
+            "QPushButton:hover{background:#25506A;}")
+        cal_btn.clicked.connect(lambda: self._send_recal(broadcast=True))
+        row.addWidget(cal_btn)
+
         row.addStretch(1)
 
         # ── F5:全域「Auto 跟隨」——代理 4 顆原生 Auto(3 chart + map)──
@@ -412,6 +424,76 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(_on_click)
         return btn
 
+    def _send_recal(self, broadcast: bool = True):
+        """發火箭端氣壓零點重校(#CMD:RECAL)並連帶做地面端姿態歸零——
+        火箭與地面的零點一鍵對齊。韌體只在 IDLE 受理,飛行中誤發會被拒收
+        (回 MSG WARN),無安全風險,故不走兩段式確認。"""
+        scope = "ALL boards" if broadcast else "focus board"
+        self.logger.info(f"🧭 [CAL] Transmitting baro re-zero (RECAL) to {scope}...")
+        self.broadcast_event("[CMD] CAL", "#00E5FF")
+        if broadcast:
+            threading.Thread(
+                target=lambda: self.send_backend_command_all("send_remote_cmd", ["cal"]),
+                daemon=True).start()
+        else:
+            threading.Thread(
+                target=lambda: self.send_backend_command("send_remote_cmd", ["cal"]),
+                daemon=True).start()
+        self._reset_angle_ground()
+
+    def _reset_angle_ground(self):
+        """地面端姿態/零偏歸零(原 /reset-angle 內聯邏輯抽出,供指令與 CAL 鈕共用)。"""
+        if not self.latest_data:
+            self.logger.error('No data received yet, cannot reset angle')
+            return
+        self.angle_deviation = self.latest_data.direction
+
+        # 1. 依據映射後的加速度讀值推算出當前對地角度作為濾波器初始值 (自動校準)
+        ax = self._get_mapped_axis(self.latest_data, "ax")
+        ay = self._get_mapped_axis(self.latest_data, "ay")
+        az = self._get_mapped_axis(self.latest_data, "az")
+        try:
+            roll_rad = math.atan2(ay, az)
+            pitch_rad = math.atan2(-ax, math.sqrt(ay**2 + az**2))
+            self.est_pitch = roll_rad * 180.0 / math.pi
+            self.est_roll = -pitch_rad * 180.0 / math.pi
+        except Exception:
+            self.est_pitch = 0.0
+            self.est_roll = 0.0
+
+        # 垂直於地面的旋轉角度 (Yaw) 則重置回到正前方 (180.0)
+        self.est_yaw = 180.0
+
+        # 2. 計算映射後的角速度均值作為靜態陀螺儀零點偏置 (Gyro Bias Calibration)
+        if self.gyro_history:
+            mapped_gyros = []
+            for h_data in self.gyro_history:
+                mgx = self._get_mapped_axis(h_data, "gx")
+                mgy = self._get_mapped_axis(h_data, "gy")
+                mgz = self._get_mapped_axis(h_data, "gz")
+                mapped_gyros.append((mgx, mgy, mgz))
+
+            self.gyro_bias_x = sum(g[0] for g in mapped_gyros) / len(mapped_gyros)
+            self.gyro_bias_y = sum(g[1] for g in mapped_gyros) / len(mapped_gyros)
+            self.gyro_bias_z = sum(g[2] for g in mapped_gyros) / len(mapped_gyros)
+        else:
+            self.gyro_bias_x = self._get_mapped_axis(self.latest_data, "gx")
+            self.gyro_bias_y = self._get_mapped_axis(self.latest_data, "gy")
+            self.gyro_bias_z = self._get_mapped_axis(self.latest_data, "gz")
+
+        self.calib_q = self.handle_angle_change(self.est_pitch, self.est_yaw, self.est_roll)
+        self.max_deviation_angle = 0.0
+        self.max_total_accel = 0.0
+        self.max_height = 0.0
+        self.ui.gl_label.setText(
+            "當前偏角: 0.0° | 最大偏角: 0.0°"
+        )
+        self.broadcast_event("[CMD] Reset Angle", "#00E5FF")
+        self.logger.info(
+            f"Angles calibrated: Yaw reset to 180.0, Pitch gravity={self.est_pitch:.2f}, Roll gravity={self.est_roll:.2f}. "
+            f"Gyro Bias calibrated - X:{self.gyro_bias_x:.4f}, Y:{self.gyro_bias_y:.4f}, Z:{self.gyro_bias_z:.4f}"
+        )
+
     def on_enter_pressed(self):
         text = self.ui.lineEdit.text().strip()
         if not text:
@@ -468,56 +550,7 @@ class MainWindow(QMainWindow):
                     daemon=True
                 ).start()
             elif cmd == "/reset-angle":
-                if self.latest_data:
-                    self.angle_deviation = self.latest_data.direction
-                    
-                    # 1. 依據映射後的加速度讀值推算出當前對地角度作為濾波器初始值 (自動校準)
-                    ax = self._get_mapped_axis(self.latest_data, "ax")
-                    ay = self._get_mapped_axis(self.latest_data, "ay")
-                    az = self._get_mapped_axis(self.latest_data, "az")
-                    try:
-                        roll_rad = math.atan2(ay, az)
-                        pitch_rad = math.atan2(-ax, math.sqrt(ay**2 + az**2))
-                        self.est_pitch = roll_rad * 180.0 / math.pi
-                        self.est_roll = -pitch_rad * 180.0 / math.pi
-                    except Exception:
-                        self.est_pitch = 0.0
-                        self.est_roll = 0.0
-                    
-                    # 垂直於地面的旋轉角度 (Yaw) 則重置回到正前方 (180.0)
-                    self.est_yaw = 180.0
-                    
-                    # 2. 計算映射後的角速度均值作為靜態陀螺儀零點偏置 (Gyro Bias Calibration)
-                    if self.gyro_history:
-                        mapped_gyros = []
-                        for h_data in self.gyro_history:
-                            mgx = self._get_mapped_axis(h_data, "gx")
-                            mgy = self._get_mapped_axis(h_data, "gy")
-                            mgz = self._get_mapped_axis(h_data, "gz")
-                            mapped_gyros.append((mgx, mgy, mgz))
-                        
-                        self.gyro_bias_x = sum(g[0] for g in mapped_gyros) / len(mapped_gyros)
-                        self.gyro_bias_y = sum(g[1] for g in mapped_gyros) / len(mapped_gyros)
-                        self.gyro_bias_z = sum(g[2] for g in mapped_gyros) / len(mapped_gyros)
-                    else:
-                        self.gyro_bias_x = self._get_mapped_axis(self.latest_data, "gx")
-                        self.gyro_bias_y = self._get_mapped_axis(self.latest_data, "gy")
-                        self.gyro_bias_z = self._get_mapped_axis(self.latest_data, "gz")
-                    
-                    self.calib_q = self.handle_angle_change(self.est_pitch, self.est_yaw, self.est_roll)
-                    self.max_deviation_angle = 0.0
-                    self.max_total_accel = 0.0
-                    self.max_height = 0.0
-                    self.ui.gl_label.setText(
-                        "當前偏角: 0.0° | 最大偏角: 0.0°"
-                    )
-                    self.broadcast_event("[CMD] Reset Angle", "#00E5FF")
-                    self.logger.info(
-                        f"Angles calibrated: Yaw reset to 180.0, Pitch gravity={self.est_pitch:.2f}, Roll gravity={self.est_roll:.2f}. "
-                        f"Gyro Bias calibrated - X:{self.gyro_bias_x:.4f}, Y:{self.gyro_bias_y:.4f}, Z:{self.gyro_bias_z:.4f}"
-                    )
-                else:
-                    self.logger.error('No data received yet, cannot reset angle')
+                self._reset_angle_ground()
             elif cmd in ["/reset-data", "/reset"]:
                 self.logger.info("Requesting backend to archive session data and create new log files...")
 
@@ -571,6 +604,10 @@ class MainWindow(QMainWindow):
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["abg"]),
                     daemon=True
                 ).start()
+            elif cmd == "/cal":
+                self._send_recal(broadcast=False)
+            elif cmd == "/cal_all":
+                self._send_recal(broadcast=True)
             elif cmd == "/focus":
                 if len(parts) >= 2 and parts[1] in self.channel_ids:
                     self.set_focus_channel(parts[1])
@@ -591,6 +628,8 @@ class MainWindow(QMainWindow):
                     "  /arm_all          - ARM ALL boards at once (ch1+ch2 hot-standby)\n"
                     "  /dpl_all          - Force Parachute Deploy on ALL boards at once\n"
                     "  /abg_all          - Deploy Airbag on ALL boards at once\n"
+                    "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
+                    "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
                     "  /focus <ch>       - Switch GUI focus channel (charts/map/stage re-render)"
                 )
                 self.logger.info(help_msg)
