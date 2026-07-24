@@ -68,6 +68,14 @@ class MainWindow(QMainWindow):
         self.last_recv_time = {ch: None for ch in self.channel_ids}
         self.channel_status = {ch: "No Data" for ch in self.channel_ids}
 
+        # ── 下行閉環狀態(R1/R4)+格式錯誤偵測+VID/PID 快取 ──
+        self.ch_last_fmt_err = {}     # ch -> 最近一次「解析失敗」時間戳(格式錯黃燈)
+        self.ch_armed_until = {}      # ch -> ARMED 視窗截止時間(火箭 MSG 回讀)
+        self.pending_confirms = {}    # (ch, action) -> 確認期限;逾期=LOUD 告警
+        self.ch_pyro_confirmed = {}   # (ch, action) -> 火箭下行確認時間戳
+        self._ports_cache = {}        # COM -> list_ports 資訊(VID/PID 識別)
+        self._ports_scan_ts = 0.0
+
         self.latest_data = None
 
         self.last_valid_location = None
@@ -394,6 +402,7 @@ class MainWindow(QMainWindow):
         def _fire():
             target = "ALL" if ch is None else ch
             self.logger.warning(f"🚨 [PYRO BUTTON] {action.upper()} -> {target}")
+            self._register_confirm(self.channel_ids if ch is None else [ch], action)
             if ch is None:
                 threading.Thread(
                     target=lambda: self.send_backend_command_all("send_remote_cmd", [action]),
@@ -574,6 +583,7 @@ class MainWindow(QMainWindow):
             elif cmd == "/dpl":
                 self.logger.warning("🚨 [EMERGENCY] Transmitting remote FORCE PARACHUTE DEPLOYMENT command...")
                 self.broadcast_event("[CMD] DPL", "#D500F9")
+                self._register_confirm([self.focus_channel], "dpl")
                 threading.Thread(
                     target=lambda: self.send_backend_command("send_remote_cmd", ["dpl"]),
                     daemon=True
@@ -581,6 +591,7 @@ class MainWindow(QMainWindow):
             elif cmd == "/abg":
                 self.logger.warning("🚨 [EMERGENCY] Transmitting remote AIRBAG DEPLOYMENT command...")
                 self.broadcast_event("[CMD] ABG", "#1DE9B6")
+                self._register_confirm([self.focus_channel], "abg")
                 threading.Thread(
                     target=lambda: self.send_backend_command("send_remote_cmd", ["abg"]),
                     daemon=True
@@ -594,12 +605,14 @@ class MainWindow(QMainWindow):
                 ).start()
             elif cmd == "/dpl_all":
                 self.logger.warning("🚨 [EMERGENCY] Broadcasting FORCE PARACHUTE DEPLOY to ALL boards...")
+                self._register_confirm(self.channel_ids, "dpl")
                 threading.Thread(
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["dpl"]),
                     daemon=True
                 ).start()
             elif cmd == "/abg_all":
                 self.logger.warning("🚨 [EMERGENCY] Broadcasting AIRBAG DEPLOY to ALL boards...")
+                self._register_confirm(self.channel_ids, "abg")
                 threading.Thread(
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["abg"]),
                     daemon=True
@@ -630,7 +643,10 @@ class MainWindow(QMainWindow):
                     "  /abg_all          - Deploy Airbag on ALL boards at once\n"
                     "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
                     "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
-                    "  /focus <ch>       - Switch GUI focus channel (charts/map/stage re-render)"
+                    "  /focus <ch>       - Switch GUI focus channel (charts/map/stage re-render)\n"
+                    "Status extras: 黃燈=Format Error(資料流入但解析全失敗);"
+                    "簡版狀態列 🔓ARMxx s=該板火箭回讀的解鎖倒數;"
+                    "pyro 指令 10s 未見下行確認(MSG/stage)會 LOUD 告警"
                 )
                 self.logger.info(help_msg)
             else:
@@ -662,6 +678,10 @@ class MainWindow(QMainWindow):
         
         self.prev_health = {}
         self.ch_latest_alt = {}   # 非焦點高度快取一併清(活頻道 0.5s 內自動回填)
+        self.ch_last_fmt_err = {}
+        self.ch_armed_until = {}
+        self.pending_confirms = {}
+        self.ch_pyro_confirmed = {}
         # F3-A 覆疊曲線一併清:start_time 已重置,舊 x 基準的點續留會錯位
         for ov in getattr(self, "alt_overlays", {}).values():
             ov["kh"].reset()
@@ -1057,6 +1077,11 @@ class MainWindow(QMainWindow):
         if prev_status in ["No Data", "Lost", "Stale", "Backend Offline"]:
             self.logger.info(f"Telemetry channel '{topic}' connection established/resumed.")
 
+        # R1 第二證據源:遙測 stage 轉 DEPLOYING(2)/DEPLOYED(3)=傘門實際點過
+        # (火箭現行 5 態;st.md 12 態上機後此對映要改——12 態的 2=上升段)
+        if data.stage in (2, 3):
+            self._confirm_pyro(topic, "dpl", "STAGE")
+
         # 收包瞬間該通道 LED 亮綠脈衝(下一輪 check_heartbeats 200ms 內覆蓋回狀態色)。
         # Backend Offline 狀態不閃:命令路徑疑似死亡時不給「健康綠」的假象。
         led = self.ch_leds.get(topic)
@@ -1135,7 +1160,11 @@ class MainWindow(QMainWindow):
             #   偶發 false-negative(GUI 卡頓漏 50ms timeout/探針快取窗)不得
             #   壓過它——否則 log 每 200ms 洗「offline↔resumed」+LED 綠紫頻閃。
             has_fresh_data = (last_time is not None and now - last_time < 1.5)
-            if not self._backend_online_cached(ch, now) and not has_fresh_data:
+            # 格式錯誤證據:backend 5s 內回報過解析失敗=資料在流(也證明後端活著)
+            fmt_recent = (ch in self.ch_last_fmt_err
+                          and now - self.ch_last_fmt_err[ch] < 5.0)
+            if not self._backend_online_cached(ch, now) and not has_fresh_data \
+                    and not fmt_recent:
                 short = f"{ch} {port} ✖後端未啟動"
                 color = "#9933FF" if int(now * 2) % 2 == 0 else "#442266"
                 self._set_led(ch, color, "#6600CC", "Backend Offline(紫=後端服務未啟動)")
@@ -1145,8 +1174,27 @@ class MainWindow(QMainWindow):
                                         f"Please start main.py or run_persist_backend.bat. (紫燈=此狀態)")
                 if is_focus:
                     self.ui.serial_label.setText(
-                        f"port︰{port}｜baudrate︰{baud}｜Status︰Backend Offline (後端服務未啟動)")
+                        f"port︰{self._port_disp(ch)}｜baudrate︰{baud}｜Status︰Backend Offline (後端服務未啟動)")
                 self._set_port_label(ch, short, "#B366FF")
+                continue
+
+            # ★格式錯誤黃燈:資料狂流但每行解析都失敗≠「無資料」——插錯裝置/
+            #   鮑率錯/對到別人訊號時,橙色 No Data 會把人帶去查天線(錯方向)。
+            #   有 fresh 遙測時不搶(偶發壞行免驚擾)。
+            if fmt_recent and not has_fresh_data:
+                status_txt = "Format Error (資料流入但解析全失敗)"
+                color = "#FFD600" if int(now * 2) % 2 == 0 else "#665500"
+                self._set_led(ch, color, "#AA8800",
+                              "Format Error(黃=有資料流但看不懂:查裝置/鮑率/頻段)")
+                self.channel_status[ch] = "Format Error"
+                if prev_status != "Format Error":
+                    self.logger.error(
+                        f"⚠ Channel '{ch}' receiving data but ALL lines fail to parse! "
+                        f"Wrong device on {port}? Wrong baudrate? Foreign signal? (黃燈=此狀態)")
+                self._set_port_label(ch, f"{ch} {port} ⚠格式錯", "#FFDD44")
+                if is_focus:
+                    self.ui.serial_label.setText(
+                        f"port︰{self._port_disp(ch)}｜baudrate︰{baud}｜Status︰{status_txt}")
                 continue
 
             if last_time is None:
@@ -1180,14 +1228,114 @@ class MainWindow(QMainWindow):
                     self._set_port_label(ch, f"{ch} {port} ✖{elapsed:.0f}s", "#FF6666")
 
             if is_focus:
-                self.ui.serial_label.setText(f"port︰{port}｜baudrate︰{baud}｜Status︰{status_txt}")
+                self.ui.serial_label.setText(
+                    f"port︰{self._port_disp(ch)}｜baudrate︰{baud}｜Status︰{status_txt}")
+
+        # ── R1:pyro 指令逾時未見下行確認 → LOUD 告警(開環變閉環的另一半)──
+        for key in [k for k, dl in self.pending_confirms.items() if now > dl]:
+            pch, paction = key
+            del self.pending_confirms[key]
+            self.logger.error(
+                f"🔴 [UNCONFIRMED] {pch} {paction.upper()} 已送出但 10s 內未見下行確認"
+                f"(MSG SUCCESS / stage 轉開傘皆無)——火箭可能沒收到,或遙測中斷。"
+                f"確認另一板狀態後考慮重發;勿因單板未確認而中止(冗餘設計)。")
+            self.broadcast_event(f"[🔴 {pch} {paction.upper()} 未確認]", "#FF3B30")
+
+    def _port_disp(self, ch: str) -> str:
+        """serial_label 詳細版的 port 欄:COM 號+VID/PID 硬體識別。"""
+        port = self.channel_configs.get(ch, {}).get("port", "N/A")
+        hw = self._port_hw_info(port)
+        return f"{port} ({hw})" if hw else str(port)
 
     def _set_port_label(self, ch: str, text: str, color: str):
         lbl = self.ch_port_labels.get(ch)
         if lbl:
+            # R4:火箭端回讀的 ARMED 視窗倒數直接掛在簡版狀態列(每板獨立)
+            armed_left = self.ch_armed_until.get(ch, 0) - time.time()
+            if armed_left > 0:
+                text += f" 🔓ARM{armed_left:.0f}s"
             lbl.setText(text)
             lbl.setStyleSheet(f"color: {color};")
+            hw = self._port_hw_info(self.channel_configs.get(ch, {}).get("port"))
+            lbl.setToolTip(hw or "無硬體識別資訊(裝置未插或 VID/PID 不可讀)")
 
+    def _port_hw_info(self, port) -> str:
+        """查 COM 埠的 VID/PID+產品名(30s 快取)。回傳如
+        'FT232R USB UART [0403:6001]',查不到回 None——用於分辨
+        「哪個 dongle 是哪個頻段」,COM 號換插孔就變、VID/PID 不會。"""
+        now = time.time()
+        if now - self._ports_scan_ts > 30.0:
+            try:
+                import serial.tools.list_ports as _lp
+                self._ports_cache = {p.device.lower(): p for p in _lp.comports()}
+            except Exception:
+                self._ports_cache = {}
+            self._ports_scan_ts = now
+        p = self._ports_cache.get(str(port or "").lower())
+        if not p:
+            return None
+        vidpid = (f"{p.vid:04X}:{p.pid:04X}"
+                  if p.vid is not None and p.pid is not None else "????")
+        name = (p.product or p.description or "").strip()
+        return f"{name} [{vidpid}]" if name else f"[{vidpid}]"
+
+
+    # ── R1/R4:火箭下行 MSG 事件的結構化解析(閉環的下行半邊)──────
+    _MSG_RE = re.compile(r"^🚀 \[ROCKET MSG\] \[(\w+)\] (.*)$")
+    _MSG_COLORS = {"SUCCESS": "#00C853", "WARN": "#FF9100", "WARNING": "#FF9100",
+                   "ERROR": "#FF3B30", "ERR": "#FF3B30", "FAIL": "#FF3B30"}
+
+    def _handle_rocket_msg(self, ch: str, message: str):
+        """解析火箭 MSG 事件:ARMED 回讀(R4)、pyro 下行確認(R1)、圖表標記。
+        burst 4 連發會重複命中——確認/解除都冪等,標記只在首次觸發。"""
+        m = self._MSG_RE.match(message)
+        if not m:
+            return
+        level, content = m.group(1).upper(), m.group(2)
+
+        if "MANUAL ARMED" in content:
+            mm = re.search(r"within (\d+)s", content)
+            secs = int(mm.group(1)) if mm else 30
+            already = self.ch_armed_until.get(ch, 0) > time.time()
+            self.ch_armed_until[ch] = time.time() + secs
+            if not already:
+                self.logger.warning(f"🔓 [{ch}] Rocket confirms ARMED ({secs}s window)")
+                self.broadcast_event(f"[🔓 {ch} ARMED]", "#FF9100")
+        elif "MANUAL SAFE" in content or "ARM expired" in content:
+            self.ch_armed_until.pop(ch, None)
+        elif "Parachute deployed successfully" in content:
+            self._confirm_pyro(ch, "dpl", "MSG")
+        elif "Airbag inflation started" in content:
+            self._confirm_pyro(ch, "abg", "MSG")
+        elif "REJECT" in content:
+            # 指令被火箭閘門拒收:等待確認中的板要立刻知道,不必空等 10s
+            hit = [k for k in self.pending_confirms if k[0] == ch]
+            for k in hit:
+                del self.pending_confirms[k]
+                self.logger.error(f"🚫 [{ch}] {k[1].upper()} REJECTED by rocket: {content}")
+            if hit:
+                self.broadcast_event(f"[🚫 {ch} REJECT]", "#FF3B30")
+        elif level in ("ERROR", "ERR", "FAIL"):
+            self.broadcast_event(f"[{ch}] {content[:36]}", self._MSG_COLORS["ERROR"])
+
+    def _confirm_pyro(self, ch: str, action: str, src: str):
+        """R1:收到火箭下行的點火證據(MSG SUCCESS 或 stage 轉開傘)。"""
+        key = (ch, action)
+        first = key not in self.ch_pyro_confirmed
+        self.ch_pyro_confirmed[key] = time.time()
+        if key in self.pending_confirms:
+            del self.pending_confirms[key]
+            self.logger.info(f"✅ [CONFIRMED] {ch} {action.upper()} verified via {src} downlink")
+            self.broadcast_event(f"[✅ {ch} {action.upper()} OK]", "#00C853")
+        elif first:
+            # 沒按過鈕卻收到開傘證據=自動開傘(正常飛行)或另一位操作員,標記即可
+            self.broadcast_event(f"[✅ {ch} {action.upper()}]", "#00C853")
+
+    def _register_confirm(self, chs, action: str):
+        """R1:pyro 指令送出時登記「等待下行確認」,10s 未見證據 → LOUD 告警。"""
+        deadline = time.time() + 10.0
+        for c in chs:
+            self.pending_confirms[(c, action)] = deadline
 
     def poll_zmq_data(self):
         """非阻塞讀取 ZMQ 消息，保證 UI 流暢不被卡死"""
@@ -1206,11 +1354,14 @@ class MainWindow(QMainWindow):
                     level = getattr(logging, level_str, logging.INFO)
                     logging.getLogger(logger_name).log(level, message)
 
-                    # 若收到火箭端特有的 MSG 事件，於圖表與地圖上標示
-                    if message.startswith("MSG "):
-                        # 轉義單引號，防止 JS addEventMarker 呼叫被截斷
-                        safe_msg = message[4:].replace("'", "\\'").replace('"', '\\"')
-                        self.broadcast_event(f"[MSG] {safe_msg}", "#FF3B30")
+                    ch = topic[:-4]   # "ch1_log" -> "ch1"
+                    # 格式錯誤黃燈證據:communicator 每行解析失敗都 logger.error 這個前綴
+                    if message.startswith("Format error:"):
+                        self.ch_last_fmt_err[ch] = time.time()
+                    # 火箭 MSG 事件(communicator 已改寫成 🚀 前綴;
+                    # 舊版 startswith("MSG ") 判斷永遠不命中=死碼,已由此取代)
+                    elif message.startswith("🚀 [ROCKET MSG]"):
+                        self._handle_rocket_msg(ch, message)
                     continue
 
                 sensor_data = SensorData.from_dict(payload_dict)
