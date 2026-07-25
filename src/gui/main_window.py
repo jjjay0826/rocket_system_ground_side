@@ -677,6 +677,23 @@ class MainWindow(QMainWindow):
                 self._send_recal(broadcast=False)
             elif cmd == "/cal_all":
                 self._send_recal(broadcast=True)
+            elif cmd == "/setch":
+                # 換 LoRa 頻道。⚠ 火箭換完後,地面 dongle 也必須跟著換,
+                # 否則該板立刻失聯——所以這裡只送指令並大聲提醒,不自動改本地。
+                if len(parts) < 2 or not parts[1].isdigit() or not (0 <= int(parts[1]) <= 80):
+                    self.logger.error("Usage: /setch <0-80>   例:/setch 72 → 922.125 MHz")
+                else:
+                    ch = int(parts[1])
+                    freq = 850.125 + ch
+                    self.logger.warning(
+                        f"📻 [SETCH] 要求焦點板 {self.focus_channel} 換到 CH{ch} ({freq:.3f} MHz)。"
+                        f"⚠ 火箭換頻後,地面 dongle 必須也設成 CH{ch},否則此板立即失聯。"
+                        f"僅 IDLE 受理;飛行中火箭會拒收。")
+                    self.broadcast_event(f"[CMD] SETCH {ch}", "#00B0FF")
+                    threading.Thread(
+                        target=lambda: self.send_backend_command(
+                            "send_remote_cmd", [f"setch_{ch}"]),
+                        daemon=True).start()
             elif cmd == "/focus":
                 if len(parts) >= 2 and parts[1] in self.channel_ids:
                     self.set_focus_channel(parts[1])
@@ -699,6 +716,8 @@ class MainWindow(QMainWindow):
                     "  /abg_all          - Deploy Airbag on ALL boards at once\n"
                     "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
                     "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
+                    "  /setch <0-80>     - Change rocket LoRa channel (850.125+ch MHz, IDLE only;\n"
+                    "                      ground dongle MUST be changed to match or board is lost)\n"
                     "  /focus <ch>       - Switch GUI focus channel (charts/map/stage re-render)\n"
                     "Status extras: 黃燈=Format Error(資料流入但解析全失敗);"
                     "簡版狀態列 🔓ARMxx s=該板火箭回讀的解鎖倒數;"

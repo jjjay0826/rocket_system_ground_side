@@ -21,6 +21,10 @@ class LoraCommand:
             return cls.ABG[1], cls.ABG[2]
         elif action_lower == "cal":
             return cls.CAL[1], cls.CAL[2]
+        elif action_lower.startswith("setch_"):
+            # 換頻:#CMD:SETCH_72# → 922.125MHz(E22-900T22D: 850.125 + ch)
+            ch = action_lower.split("_", 1)[1]
+            return f"#CMD:SETCH_{ch}#\r\n".encode("utf-8"), f"切換 LoRa 頻道 (CH{ch})"
         else:
             token = f"#CMD:{action}#\r\n".encode('utf-8')
             label = f"自訂遠端指令 ({action})"
