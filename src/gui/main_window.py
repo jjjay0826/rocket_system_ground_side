@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
         self.ch_pyro_confirmed = {}   # (ch, action) -> 火箭下行確認時間戳
         self._ports_cache = {}        # COM -> list_ports 資訊(VID/PID 識別)
         self._ports_scan_ts = 0.0
+        self.ch_view_state = {}       # ch -> 該頻道的姿態/統計快照(切焦點時交換)
 
         self.latest_data = None
 
@@ -295,9 +296,36 @@ class MainWindow(QMainWindow):
 
     # ══════════════════ 焦點切換與火工品按鈕列(F2) ══════════════════
 
+    # 焦點頻道專屬狀態:切換時整包存起來、換上另一頻道的那包。
+    # (姿態濾波/統計極值/校準基準本質上是「每塊板一套」,共用會互相污染)
+    _PER_CH_STATE = ("latest_data", "last_valid_location", "last_valid_location_time",
+                     "est_pitch", "est_roll", "est_yaw", "angle_deviation",
+                     "max_total_accel", "max_deviation_angle", "max_height",
+                     "calib_q", "quaternion", "gyro_bias_x", "gyro_bias_y",
+                     "gyro_bias_z", "gyro_history", "prev_health")
+
+    def _snapshot_focus_state(self) -> dict:
+        return {k: getattr(self, k, None) for k in self._PER_CH_STATE}
+
+    def _blank_focus_state(self) -> dict:
+        """某頻道第一次成為焦點時的乾淨初值(欄位須與 _PER_CH_STATE 對齊)。"""
+        return dict(latest_data=None, last_valid_location=None,
+                    last_valid_location_time=None,
+                    est_pitch=0.0, est_roll=0.0, est_yaw=180.0, angle_deviation=0.0,
+                    max_total_accel=0.0, max_deviation_angle=0.0, max_height=0.0,
+                    calib_q=None, quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+                    gyro_bias_x=0.0, gyro_bias_y=0.0, gyro_bias_z=0.0,
+                    gyro_history=[], prev_health={})
+
+    def _apply_focus_state(self, snap: dict):
+        for k, v in snap.items():
+            setattr(self, k, v)
+
     def set_focus_channel(self, ch: str):
-        """切換 GUI 渲染焦點頻道。切換=清空單通道視圖重畫(latest_data/
-        姿態濾波/圖表/stage 全是單套狀態,凍結混用會出鬼影)。"""
+        """切換 GUI 渲染焦點頻道 = 換視角,不是重來。
+        ★舊版切換直接 reset_gui_state(),圖表/統計/地圖全毀——來回切一次
+          資料就沒了。現在改成:每頻道的姿態濾波與極值統計各自存一份,
+          切換時整包交換;圖表歷史保留(切換點畫一條標記線標示分界)。"""
         if ch not in self.channel_ids:
             return
         # 按鈕視覺同步「先於」same-channel early return:checkable 按鈕被
@@ -308,9 +336,24 @@ class MainWindow(QMainWindow):
         if ch == self.focus_channel:
             return
         old = self.focus_channel
+        self.ch_view_state[old] = self._snapshot_focus_state()      # 存舊的
         self.focus_channel = ch
-        self.logger.info(f"🔀 Focus channel switched: {old} -> {ch} (charts/map/stage reset)")
-        self.reset_gui_state()
+        self._apply_focus_state(self.ch_view_state.get(ch) or self._blank_focus_state())
+        self.logger.info(f"🔀 Focus channel switched: {old} -> {ch} "
+                         f"(圖表歷史保留;{ch} 的統計已還原)")
+
+        # 圖表上標一條分界線,免得操作員把兩頻道的曲線段誤讀成同一塊板
+        x = time.time() - self.start_time
+        for c in (self.chart_1, self.chart_2, self.chart_3):
+            try:
+                c.add_event_marker(x, f"▼{ch}", "#3D7BD9")
+            except Exception:
+                pass
+
+        # 立刻用新頻道的狀態刷新姿態與極值顯示(否則要等下一筆遙測才更新)
+        self.attitude_displayer.update(self.quaternion)
+        self.ui.gl_label.setText(
+            f"當前偏角: {self.angle_deviation:.1f}° | 最大偏角: {self.max_deviation_angle:.1f}°")
 
     def _build_pyro_button_row(self):
         """建構 log 與命令列之間的操作列(容器 pyro_button_row 由 .ui 提供):
@@ -390,6 +433,17 @@ class MainWindow(QMainWindow):
         armed_style = ("QPushButton{background:#CC2222;color:white;border:2px solid #FF5555;"
                        "border-radius:4px;padding:2px 10px;font-weight:bold;}")
         btn.setStyleSheet(idle_style)
+        # ★寬度按「確認態的長文字」預先鎖死:否則第一按文字變長→按鈕撐大→
+        #   整排鈕左右位移,第二按時手指落點已經不是同一顆鈕(誤點鄰鈕的風險)。
+        _fm = btn.fontMetrics()
+        btn.setFixedWidth(max(_fm.horizontalAdvance(label),
+                              _fm.horizontalAdvance(f"確認 {label}?")) + 28)
+        btn.setToolTip(
+            f"{label} —— 兩段式防誤觸:\n"
+            f"① 第一次按 → 變紅並顯示「確認 {label}?」,開始 3 秒倒數\n"
+            f"② 3 秒內再按一次 → 才真正發射\n"
+            f"• 300ms 內的連按視為手抖/雙擊,直接忽略\n"
+            f"• 3 秒沒有第二次按 → 自動解除,回到安全狀態")
         state = {"armed": False, "armed_at": 0.0}
         timer = QTimer(self)
         timer.setSingleShot(True)
@@ -682,6 +736,7 @@ class MainWindow(QMainWindow):
         self.ch_armed_until = {}
         self.pending_confirms = {}
         self.ch_pyro_confirmed = {}
+        self.ch_view_state = {}   # 各頻道保存的統計/姿態一併清(這是真正的「重來」)
         # F3-A 覆疊曲線一併清:start_time 已重置,舊 x 基準的點續留會錯位
         for ov in getattr(self, "alt_overlays", {}).values():
             ov["kh"].reset()
