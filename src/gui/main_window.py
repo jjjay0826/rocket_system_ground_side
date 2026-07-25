@@ -817,7 +817,7 @@ class MainWindow(QMainWindow):
         cfg = self.channel_configs.get(self.focus_channel, {})
         port = cfg.get("port", "N/A")
         baud = cfg.get("baud", "N/A")
-        self.ui.serial_label.setText(f'port︰{port}｜baudrate︰{baud}｜Status︰Connecting')
+        self._refresh_detail_label(self.focus_channel, baud)
         # 更新圖表標題
         self.ui.chart_label_1.setText("高度與速度")
         self.ui.chart_label_2.setText("加速度")
@@ -1254,8 +1254,7 @@ class MainWindow(QMainWindow):
                     self.logger.warning(f"Telemetry backend daemon for channel '{ch}' is offline! "
                                         f"Please start main.py or run_persist_backend.bat. (紫燈=此狀態)")
                 if is_focus:
-                    self.ui.serial_label.setText(
-                        f"port︰{self._port_disp(ch)}｜baudrate︰{baud}｜Status︰Backend Offline (後端服務未啟動)")
+                    self._refresh_detail_label(ch, baud)
                 self._set_port_label(ch, short, "#B366FF")
                 continue
 
@@ -1274,8 +1273,7 @@ class MainWindow(QMainWindow):
                         f"Wrong device on {port}? Wrong baudrate? Foreign signal? (黃燈=此狀態)")
                 self._set_port_label(ch, f"{ch} {port} ⚠格式錯", "#FFDD44")
                 if is_focus:
-                    self.ui.serial_label.setText(
-                        f"port︰{self._port_disp(ch)}｜baudrate︰{baud}｜Status︰{status_txt}")
+                    self._refresh_detail_label(ch, baud)
                 continue
 
             if last_time is None:
@@ -1309,8 +1307,7 @@ class MainWindow(QMainWindow):
                     self._set_port_label(ch, f"{ch} {port} ✖{elapsed:.0f}s", "#FF6666")
 
             if is_focus:
-                self.ui.serial_label.setText(
-                    f"port︰{self._port_disp(ch)}｜baudrate︰{baud}｜Status︰{status_txt}")
+                self._refresh_detail_label(ch, baud)
 
         # ── R1:pyro 指令逾時未見下行確認 → LOUD 告警(開環變閉環的另一半)──
         for key in [k for k, dl in self.pending_confirms.items() if now > dl]:
@@ -1322,11 +1319,14 @@ class MainWindow(QMainWindow):
                 f"確認另一板狀態後考慮重發;勿因單板未確認而中止(冗餘設計)。")
             self.broadcast_event(f"[🔴 {pch} {paction.upper()} 未確認]", "#FF3B30")
 
-    def _port_disp(self, ch: str) -> str:
-        """serial_label 詳細版的 port 欄:COM 號+VID/PID 硬體識別。"""
+    def _refresh_detail_label(self, ch: str, baud):
+        """右側詳細列。★與左側簡版整合(2026-07-26):簡版已經逐頻道顯示
+        「COM 號 + 連線狀態 + pyro 電壓」,詳細版再印一次 port/status 純屬重複、
+        還把有限的橫向空間吃掉。改成只補簡版沒有的東西——焦點板的硬體識別
+        (VID/PID,插錯 dongle 一眼看穿)與連線參數。"""
         port = self.channel_configs.get(ch, {}).get("port", "N/A")
-        hw = self._port_hw_info(port)
-        return f"{port} ({hw})" if hw else str(port)
+        hw = self._port_hw_info(port) or "未知裝置(未插或 VID/PID 不可讀)"
+        self.ui.serial_label.setText(f"▶ {ch}｜{hw}｜{baud} 8N1")
 
     def _set_port_label(self, ch: str, text: str, color: str):
         lbl = self.ch_port_labels.get(ch)
@@ -1335,6 +1335,9 @@ class MainWindow(QMainWindow):
             armed_left = self.ch_armed_until.get(ch, 0) - time.time()
             if armed_left > 0:
                 text += f" 🔓ARM{armed_left:.0f}s"
+            # 焦點板加箭頭:單板指令(/dpl、/arm…)打到哪塊板一眼可辨
+            if ch == self.focus_channel:
+                text = "▶" + text
             # pyro 電源狀態(10s 內的量測才顯示,過期不留舊值誤導)
             pv = self.ch_pyro_volt.get(ch)
             if pv and time.time() - pv[2] < 10.0:
