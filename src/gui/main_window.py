@@ -76,6 +76,8 @@ class MainWindow(QMainWindow):
         self._ports_cache = {}        # COM -> list_ports 資訊(VID/PID 識別)
         self._ports_scan_ts = 0.0
         self.ch_view_state = {}       # ch -> 該頻道的姿態/統計快照(切焦點時交換)
+        self.ch_pyro_volt = {}        # ch -> (v_fuse, v_arm, 時間戳):pyro 電源監測
+        self._prev_pyro_flags = {}    # ch -> (熔斷?, 已武裝?):只在狀態翻轉時發告警
 
         self.latest_data = None
 
@@ -737,6 +739,8 @@ class MainWindow(QMainWindow):
         self.pending_confirms = {}
         self.ch_pyro_confirmed = {}
         self.ch_view_state = {}   # 各頻道保存的統計/姿態一併清(這是真正的「重來」)
+        self.ch_pyro_volt = {}
+        self._prev_pyro_flags = {}
         # F3-A 覆疊曲線一併清:start_time 已重置,舊 x 基準的點續留會錯位
         for ov in getattr(self, "alt_overlays", {}).values():
             ov["kh"].reset()
@@ -1137,6 +1141,9 @@ class MainWindow(QMainWindow):
         if data.stage in (2, 3):
             self._confirm_pyro(topic, "dpl", "STAGE")
 
+        # pyro 電源監測(火箭 PB1/PB0 ADC)
+        self._track_pyro_power(topic, data)
+
         # 收包瞬間該通道 LED 亮綠脈衝(下一輪 check_heartbeats 200ms 內覆蓋回狀態色)。
         # Backend Offline 狀態不閃:命令路徑疑似死亡時不給「健康綠」的假象。
         led = self.ch_leds.get(topic)
@@ -1309,6 +1316,16 @@ class MainWindow(QMainWindow):
             armed_left = self.ch_armed_until.get(ch, 0) - time.time()
             if armed_left > 0:
                 text += f" 🔓ARM{armed_left:.0f}s"
+            # pyro 電源狀態(10s 內的量測才顯示,過期不留舊值誤導)
+            pv = self.ch_pyro_volt.get(ch)
+            if pv and time.time() - pv[2] < 10.0:
+                vf, va = pv[0], pv[1]
+                if 0 <= vf < self._PYRO_LIVE_V:
+                    text += " 🔴熔斷"
+                elif va >= self._PYRO_LIVE_V:
+                    text += f" 🔓武裝{va:.1f}V"
+                elif vf >= self._PYRO_LIVE_V:
+                    text += f" 🔒{vf:.1f}V"
             lbl.setText(text)
             lbl.setStyleSheet(f"color: {color};")
             hw = self._port_hw_info(self.channel_configs.get(ch, {}).get("port"))
@@ -1372,6 +1389,48 @@ class MainWindow(QMainWindow):
                 self.broadcast_event(f"[🚫 {ch} REJECT]", "#FF3B30")
         elif level in ("ERROR", "ERR", "FAIL"):
             self.broadcast_event(f"[{ch}] {content[:36]}", self._MSG_COLORS["ERROR"])
+
+    # pyro 電源判讀門檻(2S 鋰電 7.4V 標稱 / 8.4V 滿電)
+    _PYRO_LIVE_V = 5.0    # 高於此 = 該段線路確實帶電
+    _PYRO_LOW_V  = 6.6    # 帶電但低於此 = 電池偏低,發射前該換
+
+    def _track_pyro_power(self, ch: str, data):
+        """追蹤火箭下行的 pyro 電源電壓,狀態翻轉時發告警。
+        VF(保險絲後端):掉到 0V = 熔斷。誤觸發時電流走 safety shunt 燒斷保險絲
+          ——點火頭沒被點著(人安全),但整條 pyro 電源同時死亡,不修就上天 = 傘開不了。
+        VA(arming 開關後端):>0V = 已武裝,這是規範 4.6.7 要求的「遠端驗證啟動狀態」。
+        -1 = 該板韌體沒有這個功能(舊版),不做任何判讀。"""
+        vf = getattr(data, "v_fuse", -1.0)
+        va = getattr(data, "v_arm", -1.0)
+        if vf < 0 and va < 0:
+            return
+        self.ch_pyro_volt[ch] = (vf, va, time.time())
+
+        blown = (0 <= vf < self._PYRO_LIVE_V)
+        armed = (va >= self._PYRO_LIVE_V)
+        prev = self._prev_pyro_flags.get(ch)
+        if prev == (blown, armed):
+            return
+        self._prev_pyro_flags[ch] = (blown, armed)
+
+        if prev is not None and blown != prev[0]:
+            if blown:
+                self.logger.error(
+                    f"🔴 [{ch}] PYRO FUSE BLOWN — 保險絲後端 {vf:.2f}V。"
+                    f"誤觸發已被並聯導線擋下(點火頭未點著),但這塊板現在「點不了火」。"
+                    f"發射前必須更換保險絲;另一板若正常仍可獨立完成回收。")
+                self.broadcast_event(f"[🔴 {ch} 保險絲熔斷]", "#FF3B30")
+            else:
+                self.logger.info(f"✅ [{ch}] pyro 電源恢復 {vf:.2f}V(保險絲已更換)")
+        if prev is not None and armed != prev[1]:
+            if armed:
+                self.logger.warning(f"🔓 [{ch}] PYRO ARMED — arming 開關已導通 {va:.2f}V"
+                                    f"(儲能裝置進入啟動狀態,人員勿靠近火箭)")
+                self.broadcast_event(f"[🔓 {ch} 已武裝]", "#FF9100")
+            else:
+                self.logger.info(f"🔒 [{ch}] pyro 已解除武裝(arming 開關斷開)")
+        if not blown and 0 <= vf < self._PYRO_LOW_V:
+            self.logger.warning(f"⚠ [{ch}] pyro 電池偏低 {vf:.2f}V(2S 標稱 7.4V)")
 
     def _confirm_pyro(self, ch: str, action: str, src: str):
         """R1:收到火箭下行的點火證據(MSG SUCCESS 或 stage 轉開傘)。"""

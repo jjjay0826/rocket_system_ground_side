@@ -42,6 +42,9 @@ class SensorData:
     cond_b_raw: int = 0
     cond_b_eff: int = 0
     peak_height: float = 0.0
+    # pyro 電源監測(火箭端 PB1/PB0 ADC)。-1 = 該板無量測能力(舊韌體或 ADC 掛)
+    v_fuse: float = -1.0   # 保險絲後端電壓:0V=熔斷(誤觸發已被 shunt 擋下)
+    v_arm: float = -1.0    # arming 開關後端電壓:>0=已武裝(規範 4.6.7 遠端驗證)
     sd_writes: int = 0
     lora_seq: int = 0
     lora_success: int = 0
@@ -86,7 +89,7 @@ class SensorData:
                 "flight_state", "module_state", "gnss_state", "sv_visible", "sv_used",
                 "buffer_val", "count_val", "cond_a_raw", "cond_a_eff", "cond_b_raw",
                 "cond_b_eff", "peak_height", "sd_writes", "lora_seq", "lora_success",
-                "lora_total", "gs_timestamp"
+                "lora_total", "gs_timestamp", "v_fuse", "v_arm"
             ]
             for field in optional_fields:
                 if field in data:
@@ -140,6 +143,8 @@ class SensorData:
             'PK': r'\bPK([+-]?\d*\.?\d+)\b',
             'SD': r'\bSD(\d+)\b',
             'LR': r'\bLR:(\d+),(\d+),(\d+)\b',
+            'VF': r'\bVF([+-]?\d*\.?\d+)\b',
+            'VA': r'\bVA([+-]?\d*\.?\d+)\b',
             'LAT': r'\bLAT([+-]?\d*\.?\d+)\b',
             'LON': r'\bLON([+-]?\d*\.?\d+)\b',
         }
@@ -274,6 +279,10 @@ class SensorData:
             
         direction = 0.0
 
+        # pyro 電源監測(缺欄位=舊韌體 → -1 表示「無此能力」,不可與 0V 熔斷混淆)
+        v_fuse = float(extracted['VF']) if extracted['VF'] is not None else -1.0
+        v_arm  = float(extracted['VA']) if extracted['VA'] is not None else -1.0
+
         # GPS 經緯度解析
         lat = float(extracted['LAT']) if extracted['LAT'] else 25.0
         lon = float(extracted['LON']) if extracted['LON'] else 121.5
@@ -309,6 +318,8 @@ class SensorData:
             cond_b_raw=cb_raw,
             cond_b_eff=cb_eff,
             peak_height=pk_val,
+            v_fuse=v_fuse,
+            v_arm=v_arm,
             sd_writes=sd_val,
             lora_seq=lora_seq,
             lora_success=lora_success,
@@ -353,7 +364,9 @@ class SensorData:
             "sd_writes": self.sd_writes,
             "lora_seq": self.lora_seq,
             "lora_success": self.lora_success,
-            "lora_total": self.lora_total
+            "lora_total": self.lora_total,
+            "v_fuse": self.v_fuse,
+            "v_arm": self.v_arm
         }
 @dataclass
 class LogData:
