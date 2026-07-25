@@ -215,7 +215,12 @@ def main():
     communicator.add_observer(storage_obs)
 
     # 5. 註冊 ZMQ 發布觀察者
-    zmq_pub_obs = ZmqPublishObserver(zmq_port, topic=channel_id)
+    try:
+        zmq_pub_obs = ZmqPublishObserver(zmq_port, topic=channel_id)
+    except zmq.error.ZMQError as e:
+        logger.error(f"❌ [{channel_id.upper()}] ZMQ bind failed on port {zmq_port}: {e}. "
+                     f"A backend daemon is ALREADY running for this channel!")
+        sys.exit(1)
     communicator.add_observer(zmq_pub_obs)
 
     # 💡 註冊 ZMQ 日誌轉發 Handler，用以將背景串列埠連接日誌傳回 GUI
