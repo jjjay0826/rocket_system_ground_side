@@ -5,13 +5,15 @@ import math
 import socket
 import re
 from datetime import datetime
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QCheckBox, QLabel, QPushButton
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QCheckBox,
+                             QLabel, QPushButton, QWidget)
 from PyQt6.QtQuick import QQuickWindow, QSGRendererInterface
 from PyQt6.QtCore import QTimer
 
 from src.gui.ui_main import Ui_MainWindow  
 from src.gui.qt_observer import QtGuiObserver
 from src.gui.visualizers.line_chart import LineChartDrawer
+from src.gui.flow_layout import FlowLayout
 from src.gui.visualizers.stage_display import StageDisplayer
 import logging
 from src.gui.visualizers.log_displayer import LogDisplayer
@@ -359,9 +361,17 @@ class MainWindow(QMainWindow):
 
     def _build_pyro_button_row(self):
         """建構 log 與命令列之間的操作列(容器 pyro_button_row 由 .ui 提供):
-        [焦點: ch1 ch2] ┃ [傘/囊 x 各板] ┃ [傘ALL 囊ALL] ┃ [Auto跟隨]
-        點火鈕=兩段式防誤觸:第一按變紅倒數 3 秒,再按才發射,逾時還原。"""
-        row = self.ui.pyro_button_row
+        [焦點: ch1 ch2] ┃ [傘/囊 x 各板] ┃ [傘ALL 囊ALL] ┃ [校準] [Auto跟隨]
+        點火鈕=兩段式防誤觸:第一按變紅倒數 3 秒,再按才發射,逾時還原。
+
+        ★用 FlowLayout 而非 .ui 給的 QHBoxLayout:整排約 950px,寬螢幕一列排得
+          下,但小筆電會溢出把右側圖表擠掉。FlowLayout 在寬度不足時自動折成
+          兩列,不必為不同螢幕維護兩套版面。"""
+        outer = self.ui.pyro_button_row      # .ui 提供的 QHBoxLayout
+        holder = QWidget()
+        row = FlowLayout(holder, margin=0, spacing=6)
+        outer.addWidget(holder)
+        self.pyro_flow = row                 # 測試/後續存取用
 
         lbl = QLabel("焦點:")
         lbl.setStyleSheet("color: #888888;")
@@ -402,7 +412,7 @@ class MainWindow(QMainWindow):
         cal_btn.clicked.connect(lambda: self._send_recal(broadcast=True))
         row.addWidget(cal_btn)
 
-        row.addStretch(1)
+        # (FlowLayout 靠左排並自動折行,不需要 addStretch 撐開)
 
         # ── F5:全域「Auto 跟隨」——代理 4 顆原生 Auto(3 chart + map)──
         # 原 checkbox 隱藏但保留(update_ui 照舊讀它們,零改繪圖邏輯);
@@ -435,11 +445,14 @@ class MainWindow(QMainWindow):
         armed_style = ("QPushButton{background:#CC2222;color:white;border:2px solid #FF5555;"
                        "border-radius:4px;padding:2px 10px;font-weight:bold;}")
         btn.setStyleSheet(idle_style)
-        # ★寬度按「確認態的長文字」預先鎖死:否則第一按文字變長→按鈕撐大→
-        #   整排鈕左右位移,第二按時手指落點已經不是同一顆鈕(誤點鄰鈕的風險)。
+        # ★寬度預先鎖死,兩種文字取較寬者:否則第一按文字變長→按鈕撐大→整排
+        #   左右位移,第二按時手指落點已不是同一顆鈕(誤點鄰鈕)。
+        #   確認態刻意用極短的「確認?」——早期版本寫「確認 傘 ch1?」,鎖出來的
+        #   寬度是原本兩倍,六顆鈕就把整條操作列撐爆、擠掉右側圖表。
+        #   按鈕位置不動 + 轉紅 + 粗體,已足夠辨識是哪一顆在等確認。
         _fm = btn.fontMetrics()
         btn.setFixedWidth(max(_fm.horizontalAdvance(label),
-                              _fm.horizontalAdvance(f"確認 {label}?")) + 28)
+                              _fm.horizontalAdvance("確認?")) + 20)
         btn.setToolTip(
             f"{label} —— 兩段式防誤觸:\n"
             f"① 第一次按 → 變紅並顯示「確認 {label}?」,開始 3 秒倒數\n"
@@ -481,7 +494,7 @@ class MainWindow(QMainWindow):
             else:
                 state["armed"] = True
                 state["armed_at"] = time.monotonic()
-                btn.setText(f"確認 {label}?")
+                btn.setText("確認?")
                 btn.setStyleSheet(armed_style)
                 timer.start(3000)   # 3 秒未確認自動還原
 
@@ -1325,8 +1338,12 @@ class MainWindow(QMainWindow):
         還把有限的橫向空間吃掉。改成只補簡版沒有的東西——焦點板的硬體識別
         (VID/PID,插錯 dongle 一眼看穿)與連線參數。"""
         port = self.channel_configs.get(ch, {}).get("port", "N/A")
-        hw = self._port_hw_info(port) or "未知裝置(未插或 VID/PID 不可讀)"
-        self.ui.serial_label.setText(f"▶ {ch}｜{hw}｜{baud} 8N1")
+        hw = self._port_hw_info(port)
+        # 焦點標記 ▶ 只放在左側簡版一次,這裡不再重複(先前兩邊都印 ▶chN)
+        self.ui.serial_label.setText(f"{ch}｜{hw or '未知裝置'}｜{baud} 8N1")
+        self.ui.serial_label.setToolTip(
+            f"{ch} = {port}\n"
+            + (f"硬體:{hw}" if hw else "查不到 VID/PID:裝置未插上,或驅動未提供識別碼"))
 
     def _set_port_label(self, ch: str, text: str, color: str):
         lbl = self.ch_port_labels.get(ch)
