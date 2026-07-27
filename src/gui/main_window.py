@@ -699,6 +699,12 @@ class MainWindow(QMainWindow):
                 else:
                     ch = int(parts[1])
                     freq = 850.125 + ch
+                    # 合規提示(不阻擋):NCC LP0002 只准 920-925MHz = CH70~74
+                    if not (70 <= ch <= 74):
+                        self.logger.error(
+                            f"⚠ [SETCH] CH{ch} = {freq:.3f} MHz 落在 920-925 MHz 合規頻段外!"
+                            f"台灣 LP0002 只准 CH70~74(920.125~924.125 MHz)。"
+                            f"指令仍會送出——請確認這是你要的。")
                     self.logger.warning(
                         f"📻 [SETCH] 要求焦點板 {self.focus_channel} 換到 CH{ch} ({freq:.3f} MHz)。"
                         f"⚠ 火箭換頻後,地面 dongle 必須也設成 CH{ch},否則此板立即失聯。"
