@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         self.ch_view_state = {}       # ch -> 該頻道的姿態/統計快照(切焦點時交換)
         self.ch_pyro_volt = {}        # ch -> (v_fuse, v_arm, 時間戳):pyro 電源監測
         self._prev_pyro_flags = {}    # ch -> (熔斷?, 已武裝?):只在狀態翻轉時發告警
+        self.ch_prev_stage = {}       # ch -> 上一筆 stage(偵測「轉入」開傘的邊緣)
 
         self.latest_data = None
 
@@ -773,6 +774,7 @@ class MainWindow(QMainWindow):
         self.ch_view_state = {}   # 各頻道保存的統計/姿態一併清(這是真正的「重來」)
         self.ch_pyro_volt = {}
         self._prev_pyro_flags = {}
+        self.ch_prev_stage = {}
         # F3-A 覆疊曲線一併清:start_time 已重置,舊 x 基準的點續留會錯位
         for ov in getattr(self, "alt_overlays", {}).values():
             ov["kh"].reset()
@@ -1168,9 +1170,17 @@ class MainWindow(QMainWindow):
         if prev_status in ["No Data", "Lost", "Stale", "Backend Offline"]:
             self.logger.info(f"Telemetry channel '{topic}' connection established/resumed.")
 
-        # R1 第二證據源:遙測 stage 轉 DEPLOYING(2)/DEPLOYED(3)=傘門實際點過
+        # R1 第二證據源:stage「轉入」DEPLOYING(2)/DEPLOYED(3) 的那一刻。
+        # ★必須是邊緣(轉入)而非位準(現在是 2/3):stage 一旦轉開傘就整趟飛行
+        #   維持不變,用位準判斷會讓「之後」送出的任何開傘指令在 0.5s 內被
+        #   這個舊狀態判定為成功——上行完全死掉也照樣顯示 ✅,確認機制在最
+        #   需要它誠實的時候失效。
+        # ★prev_stage is None(該頻道第一筆)不觸發:GUI 中途啟動時火箭可能
+        #   早就開傘了,那不構成「剛剛送出的指令被收到」的證據。
         # (火箭現行 5 態;st.md 12 態上機後此對映要改——12 態的 2=上升段)
-        if data.stage in (2, 3):
+        prev_stage = self.ch_prev_stage.get(topic)
+        self.ch_prev_stage[topic] = data.stage
+        if prev_stage is not None and data.stage in (2, 3) and prev_stage not in (2, 3):
             self._confirm_pyro(topic, "dpl", "STAGE")
 
         # pyro 電源監測(火箭 PB1/PB0 ADC)
@@ -1323,7 +1333,7 @@ class MainWindow(QMainWindow):
                 self._refresh_detail_label(ch, baud)
 
         # ── R1:pyro 指令逾時未見下行確認 → LOUD 告警(開環變閉環的另一半)──
-        for key in [k for k, dl in self.pending_confirms.items() if now > dl]:
+        for key in [k for k, p in self.pending_confirms.items() if now > p["deadline"]]:
             pch, paction = key
             del self.pending_confirms[key]
             self.logger.error(
@@ -1471,12 +1481,15 @@ class MainWindow(QMainWindow):
         if not blown and 0 <= vf < self._PYRO_LOW_V:
             self.logger.warning(f"⚠ [{ch}] pyro 電池偏低 {vf:.2f}V(2S 標稱 7.4V)")
 
-    def _confirm_pyro(self, ch: str, action: str, src: str):
-        """R1:收到火箭下行的點火證據(MSG SUCCESS 或 stage 轉開傘)。"""
+    def _confirm_pyro(self, ch: str, action: str, src: str, evidence_at: float = None):
+        """R1:收到火箭下行的點火證據(MSG SUCCESS 或 stage 轉入開傘)。
+        evidence_at = 這份證據產生的時刻;早於指令送出時刻的證據不予採信。"""
+        ev = time.time() if evidence_at is None else evidence_at
         key = (ch, action)
         first = key not in self.ch_pyro_confirmed
-        self.ch_pyro_confirmed[key] = time.time()
-        if key in self.pending_confirms:
+        self.ch_pyro_confirmed[key] = ev
+        pend = self.pending_confirms.get(key)
+        if pend is not None and ev >= pend["sent_at"]:
             del self.pending_confirms[key]
             self.logger.info(f"✅ [CONFIRMED] {ch} {action.upper()} verified via {src} downlink")
             self.broadcast_event(f"[✅ {ch} {action.upper()} OK]", "#00C853")
@@ -1485,10 +1498,12 @@ class MainWindow(QMainWindow):
             self.broadcast_event(f"[✅ {ch} {action.upper()}]", "#00C853")
 
     def _register_confirm(self, chs, action: str):
-        """R1:pyro 指令送出時登記「等待下行確認」,10s 未見證據 → LOUD 告警。"""
-        deadline = time.time() + 10.0
+        """R1:pyro 指令送出時登記「等待下行確認」,10s 未見證據 → LOUD 告警。
+        ★記下送出時刻:確認只能由「這次指令之後」出現的證據滿足。否則備援
+          指令會被上一次開傘留下的舊狀態瞬間「確認」,即使上行早已中斷。"""
+        now = time.time()
         for c in chs:
-            self.pending_confirms[(c, action)] = deadline
+            self.pending_confirms[(c, action)] = {"sent_at": now, "deadline": now + 10.0}
 
     def poll_zmq_data(self):
         """非阻塞讀取 ZMQ 消息，保證 UI 流暢不被卡死"""
