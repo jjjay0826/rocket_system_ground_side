@@ -1435,8 +1435,28 @@ class MainWindow(QMainWindow):
         elif "Airbag inflation started" in content:
             self._confirm_pyro(ch, "abg", "MSG")
         elif "REJECT" in content:
-            # 指令被火箭閘門拒收:等待確認中的板要立刻知道,不必空等 10s
-            hit = [k for k in self.pending_confirms if k[0] == ch]
+            # 指令被火箭閘門拒收:等待確認中的板要立刻知道,不必空等 10s。
+            # ★必須比對「被拒的是哪一道指令」:舊版只比對頻道,結果一句
+            #   RECAL/SETCH 的拒收會把待確認的開傘指令一起清掉,而且把紅色
+            #   告警貼上「DPL 被拒收」的錯誤標籤——操作員會以為開傘指令失敗。
+            low = content.lower()
+            if "already deployed" in low:
+                # 語意是「傘已經開了」= 開傘的證據,不是失敗。burst 第 2~4 發
+                # 必然收到這句;SUCCESS 幀掉包時這是唯一的線索,不可誤報成紅色失敗。
+                self._confirm_pyro(ch, "dpl", "MSG(already deployed)")
+                return
+            # 韌體的 pyro 拒收會自報 dpl/abg;非 pyro 指令(recal/setch/channel)
+            # 一律不動 pending——它們跟火工品無關。
+            acts = [a for a in ("dpl", "abg") if a in low]
+            if not acts:
+                if any(t in low for t in ("recal", "setch", "channel")):
+                    self.logger.warning(f"⚠ [{ch}] 非火工品指令被拒收:{content}")
+                    return
+                # 舊韌體的拒收訊息不帶指令名(向後相容):只能全清,但講清楚
+                acts = ["dpl", "abg"]
+                self.logger.warning(
+                    f"⚠ [{ch}] 火箭回報拒收但未指明指令(舊版韌體):{content}")
+            hit = [k for k in self.pending_confirms if k[0] == ch and k[1] in acts]
             for k in hit:
                 del self.pending_confirms[k]
                 self.logger.error(f"🚫 [{ch}] {k[1].upper()} REJECTED by rocket: {content}")
