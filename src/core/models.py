@@ -143,6 +143,7 @@ class SensorData:
             'PK': r'\bPK([+-]?\d*\.?\d+)\b',
             'SD': r'\bSD(\d+)\b',
             'LR': r'\bLR:(\d+),(\d+),(\d+)\b',
+            'SQ': r'\bSQ(\d+)\b',
             'VF': r'\bVF([+-]?\d*\.?\d+)\b',
             'VA': r'\bVA([+-]?\d*\.?\d+)\b',
             'LAT': r'\bLAT([+-]?\d*\.?\d+)\b',
@@ -278,6 +279,12 @@ class SensorData:
             rotationPitch = 0.0
             
         direction = 0.0
+
+        # 發送序號:火箭每發一包遞增 1,地面端用跳號量化掉包率。
+        # 只在 SQ 欄位存在時覆寫——舊格式的 LR:seq,ok,total(上面第一段)仍有效,
+        # 沒有 SQ 就不能把它歸零。0 = 兩種格式都沒帶,不參與掉包計算。
+        if extracted['SQ'] is not None:
+            lora_seq = int(extracted['SQ'])
 
         # pyro 電源監測(缺欄位=舊韌體 → -1 表示「無此能力」,不可與 0V 熔斷混淆)
         v_fuse = float(extracted['VF']) if extracted['VF'] is not None else -1.0

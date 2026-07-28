@@ -4,6 +4,7 @@ import threading
 import math
 import socket
 import re
+from collections import deque
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QCheckBox,
                              QLabel, QPushButton, QWidget)
@@ -81,6 +82,9 @@ class MainWindow(QMainWindow):
         self.ch_pyro_volt = {}        # ch -> (v_fuse, v_arm, 時間戳):pyro 電源監測
         self._prev_pyro_flags = {}    # ch -> (熔斷?, 已武裝?):只在狀態翻轉時發告警
         self.ch_prev_stage = {}       # ch -> 上一筆 stage(偵測「轉入」開傘的邊緣)
+        self.ch_seq = {}              # ch -> 最近收到的序號(deque):量化掉包率
+        self.ch_link = {}             # ch -> (到達率 0~1, 樣本數)
+        self._prev_batt_level = {}    # ch -> "ok"/"low"/"crit":只在惡化時警告
 
         self.latest_data = None
 
@@ -781,6 +785,9 @@ class MainWindow(QMainWindow):
         self.ch_pyro_volt = {}
         self._prev_pyro_flags = {}
         self.ch_prev_stage = {}
+        self.ch_seq = {}
+        self.ch_link = {}
+        self._prev_batt_level = {}
         # F3-A 覆疊曲線一併清:start_time 已重置,舊 x 基準的點續留會錯位
         for ov in getattr(self, "alt_overlays", {}).values():
             ov["kh"].reset()
@@ -1191,6 +1198,8 @@ class MainWindow(QMainWindow):
 
         # pyro 電源監測(火箭 PB1/PB0 ADC)
         self._track_pyro_power(topic, data)
+        # 鏈路品質:用火箭的發送序號跳號量化掉包
+        self._track_link_quality(topic, data)
 
         # 收包瞬間該通道 LED 亮綠脈衝(下一輪 check_heartbeats 200ms 內覆蓋回狀態色)。
         # Backend Offline 狀態不閃:命令路徑疑似死亡時不給「健康綠」的假象。
@@ -1380,7 +1389,13 @@ class MainWindow(QMainWindow):
                 elif va >= self._PYRO_LIVE_V:
                     text += f" 🔓武裝{va:.1f}V"
                 elif vf >= self._PYRO_LIVE_V:
-                    text += f" 🔒{vf:.1f}V"
+                    lvl = self._batt_level(vf)
+                    icon = {"ok": "🔋", "low": "🪫", "crit": "🪫⚠"}.get(lvl, "🔒")
+                    text += f" {icon}{vf:.1f}V"
+            # 鏈路到達率(靠火箭序號跳號算出來的,不是訊號強度)
+            lt = self._link_text(ch)
+            if lt:
+                text += " " + lt[0]
             lbl.setText(text)
             lbl.setStyleSheet(f"color: {color};")
             hw = self._port_hw_info(self.channel_configs.get(ch, {}).get("port"))
@@ -1465,9 +1480,57 @@ class MainWindow(QMainWindow):
         elif level in ("ERROR", "ERR", "FAIL"):
             self.broadcast_event(f"[{ch}] {content[:36]}", self._MSG_COLORS["ERROR"])
 
-    # pyro 電源判讀門檻(2S 鋰電 7.4V 標稱 / 8.4V 滿電)
+    # ── 鏈路品質:用火箭的發送序號量化掉包 ──────────────────────────
+    _LINK_WINDOW = 40     # 滾動視窗(2Hz → 約 20 秒)
+    _LINK_MIN_N  = 8      # 少於這麼多樣本不下結論(剛連上時別亂報)
+
+    def _track_link_quality(self, ch: str, data):
+        """火箭每發一包 SQ 遞增 1。地面端只要看序號跳號就知道掉了幾包——
+        這是唯一能量化「RF 到達率」的資料,而且火箭本來就在數了,只是
+        以前沒放進封包(CSV 的 lora_seq 因此恆為 0)。
+        seq==0 表示舊韌體沒帶這欄位,直接不做統計。"""
+        seq = getattr(data, "lora_seq", 0)
+        if not seq:
+            return
+        dq = self.ch_seq.get(ch)
+        if dq is None:
+            dq = deque(maxlen=self._LINK_WINDOW)
+            self.ch_seq[ch] = dq
+        # 序號倒退 = 火箭重開機(序號歸零)→ 舊樣本作廢,重新起算
+        if dq and seq < dq[-1]:
+            dq.clear()
+            self.logger.info(f"[{ch}] 序號重置(火箭重新開機?),掉包統計重新起算")
+        dq.append(seq)
+        if len(dq) >= self._LINK_MIN_N:
+            span = dq[-1] - dq[0] + 1          # 這段期間火箭「應該」發了幾包
+            if span > 0:
+                self.ch_link[ch] = (len(dq) / span, len(dq))
+
+    def _link_text(self, ch: str):
+        """回傳 (顯示字串, 顏色);資料不足回 None。"""
+        lk = self.ch_link.get(ch)
+        if not lk:
+            return None
+        rate, n = lk
+        pct = max(0.0, min(1.0, rate)) * 100.0
+        color = "#66DD66" if pct >= 90 else ("#FFDD44" if pct >= 70 else "#FF6666")
+        return (f"📶{pct:.0f}%", color)
+
+    # pyro 電源判讀門檻(2S 鋰電:8.4V 滿 / 7.4V 標稱 / 6.0V 空)
     _PYRO_LIVE_V = 5.0    # 高於此 = 該段線路確實帶電
-    _PYRO_LOW_V  = 6.6    # 帶電但低於此 = 電池偏低,發射前該換
+    _PYRO_LOW_V  = 7.0    # 低於此 = 電量偏低(約剩 20%),發射前應更換
+    _PYRO_CRIT_V = 6.6    # 低於此 = 電量危險(約剩 5%),不應繼續飛
+
+    def _batt_level(self, vf: float) -> str:
+        """2S 鋰電電壓分級。刻意不換算成百分比——鋰電在變動負載下的
+        電壓↔電量關係非線性,硬報一個百分比會給出比實際更精確的假象。"""
+        if vf < 0 or vf < self._PYRO_LIVE_V:
+            return "na"
+        if vf < self._PYRO_CRIT_V:
+            return "crit"
+        if vf < self._PYRO_LOW_V:
+            return "low"
+        return "ok"
 
     def _track_pyro_power(self, ch: str, data):
         """追蹤火箭下行的 pyro 電源電壓,狀態翻轉時發告警。
@@ -1483,6 +1546,29 @@ class MainWindow(QMainWindow):
 
         blown = (0 <= vf < self._PYRO_LIVE_V)
         armed = (va >= self._PYRO_LIVE_V)
+
+        # ── 電量分級警告(只在「變差」時出聲,回升不吵)──────────────
+        # ★這段必須放在下面的 early return 之前:舊版把它擺在後面,
+        #   只有 blown/armed 翻轉時才會走到 → 低電量警告等同死碼。
+        lvl = self._batt_level(vf)
+        if lvl != "na":
+            prev_lvl = self._prev_batt_level.get(ch)
+            if prev_lvl != lvl:
+                self._prev_batt_level[ch] = lvl
+                rank = {"ok": 0, "low": 1, "crit": 2}
+                if prev_lvl is not None and rank[lvl] > rank[prev_lvl]:
+                    if lvl == "crit":
+                        self.logger.error(
+                            f"🔋 [{ch}] 電量危險 {vf:.2f}V(2S 低於 {self._PYRO_CRIT_V}V,"
+                            f"約剩 5%)——不應繼續飛行,立即更換電池")
+                        self.broadcast_event(f"[🔋 {ch} 電量危險]", "#FF3B30")
+                    else:
+                        self.logger.warning(
+                            f"🔋 [{ch}] 電量偏低 {vf:.2f}V(2S 低於 {self._PYRO_LOW_V}V,"
+                            f"約剩 20%)——發射前建議更換")
+                elif prev_lvl is not None and lvl == "ok":
+                    self.logger.info(f"🔋 [{ch}] 電量恢復正常 {vf:.2f}V(已換電池?)")
+
         prev = self._prev_pyro_flags.get(ch)
         if prev == (blown, armed):
             return
@@ -1504,8 +1590,7 @@ class MainWindow(QMainWindow):
                 self.broadcast_event(f"[🔓 {ch} 已武裝]", "#FF9100")
             else:
                 self.logger.info(f"🔒 [{ch}] pyro 已解除武裝(arming 開關斷開)")
-        if not blown and 0 <= vf < self._PYRO_LOW_V:
-            self.logger.warning(f"⚠ [{ch}] pyro 電池偏低 {vf:.2f}V(2S 標稱 7.4V)")
+        # (電量警告已移到本函式開頭的 early return 之前——擺這裡永遠走不到)
 
     def _confirm_pyro(self, ch: str, action: str, src: str, evidence_at: float = None):
         """R1:收到火箭下行的點火證據(MSG SUCCESS 或 stage 轉入開傘)。
