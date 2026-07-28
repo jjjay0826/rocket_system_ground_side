@@ -164,6 +164,19 @@ class SensorData:
         if extracted['T'] is None:
             raise ValueError("Not in telemetry format: missing 'T' field")
 
+        # ★截斷偵測:舊版只檢查 T,其餘欄位缺了就靜默填 0 —— RF 干擾切掉封包
+        # 尾巴時,'T12345 AX+0.01' 會被當成一筆完整資料接受,產生高度 0、
+        # 速度 0、**ST 0** 的假紀錄寫進 CSV。
+        # 其中 ST 最危險:假的 stage=0 會重設地面站的 stage 邊緣偵測基準,
+        # 下一筆真封包的 stage=2 就成了「0→2 的轉入」→ 在沒有新證據的情況下
+        # 確認開傘指令(正是下行確認機制要防的假陽性)。
+        # ST/MOD/GA 位於封包後段,任一缺席即代表尾巴被切掉 → 整筆丟棄。
+        _required = [k for k in ('ST', 'MOD', 'GA') if extracted[k] is None]
+        if _required:
+            raise ValueError(
+                f"Truncated telemetry frame: missing {','.join(_required)} "
+                f"(len={len(line)})")
+
         t_val = int(extracted['T'])
         ax = float(extracted['AX']) if extracted['AX'] else 0.0
         ay = float(extracted['AY']) if extracted['AY'] else 0.0
@@ -291,6 +304,12 @@ class SensorData:
         v_arm  = float(extracted['VA']) if extracted['VA'] is not None else -1.0
 
         # GPS 經緯度解析
+        # ★GPS 宣稱已定位、座標卻缺席 = 封包在 LAT/LON 之前就被切掉。
+        # 舊碼會靜默套用 (25.0, 121.5) —— 台北。那個座標會被當成「有效定位」
+        # 畫在地圖上、寫進 CSV,落海搜救時是災難性的誤導。
+        # 這種情況降級為 NO_FIX,讓地面站照「沒有定位」處理。
+        if gnss_state == "FIX_3D" and (extracted['LAT'] is None or extracted['LON'] is None):
+            gnss_state = "NO_FIX"
         lat = float(extracted['LAT']) if extracted['LAT'] else 25.0
         lon = float(extracted['LON']) if extracted['LON'] else 121.5
         location = (lat, lon)
