@@ -1,5 +1,5 @@
 # rocket_system_ground_side
-###### *version-V1.4.1* 
+###### *version-v3.4* 
 ---
 ## 簡介
 - 火箭系統的地面端程式
@@ -123,58 +123,70 @@ sequenceDiagram
 >
 
 ## 更新
-### 1.4
-```
 
-1.4.1  (2026-07-30)
+> [!NOTE]
+> **編號有兩套，不連續。** `1.0.x` 是 micro:bit 原型時代的內部編號；
+> 改接真實航電之後改用 GitHub Release 標籤 **`v3.x`**
+> （已發布的 `v3.0-兩通道獨立` = `a39399d`，2026-07-20）。
+> 以下依 release track 記錄，`v3.0` 以前的 `1.0.x` 保留為歷史。
+
+### v3.4
+```
+v3.4  (2026-07-30)
 合併 jx06T 的重複 daemon 防護（啟動前探 port、bind 失敗給人話）
 protocol.h / telemetry_format.md / rocket_side_requirements.md 對齊實際韌體
-README 序列埠格式段落改寫（原本仍是 microbit JSON 時代）
+  · ST 由 12 狀態修正為 5 狀態（原本會把「正在放傘」讀成「點火」）
+  · MOD 全正常由 E 改正為 F；C 欄正名為「開傘條件」
+  · rocket_side_requirements 的 ARM 規則：飛行中其實不需要先 /arm
+README 序列埠格式與執行步驟改寫（原本仍是 micro:bit JSON 時代）
+```
 
-1.4.0  (2026-07-28)
+### v3.3
+```
+v3.3  (2026-07-27 ~ 07-28)
 截斷封包整幀拒收（缺 ST/MOD/GA 即丟棄，防假 stage 0 觸發誤確認）
 GPS 宣稱定位但無座標 → 降級 NO_FIX（不再標成台北）
 ZMQ PUB socket 加共用 RLock（遙測與 log 兩條路徑共用一顆 socket）
 連線送達率顯示（用 SQ 序號算，含重開機偵測）
 電量告警修復（原本被提早 return 擋掉，是死碼）
-
-1.3.2  (2026-07-27)
 操作列改 FlowLayout，視窗變窄時自動換行不再壓爛版面
 開傘確認不再被「過期狀態」滿足（stage 邊緣偵測）
 REJECT 只清真正被拒的那道指令（原本一句 RECAL 拒收會誤清開傘指令）
 /setch 頻段外（非 CH70-74）警示
+```
 
-1.3.1  (2026-07-26)
+### v3.2
+```
+v3.2  (2026-07-24 ~ 07-26)
+遠端 RECAL：一鍵重設火箭端氣壓零點 + 地面端姿態歸零
+火工品閉環：下行開傘確認、ARMED 回讀、格式錯誤狀態、VID/PID 辨識
 /setch 遠端換 LoRa 頻道
 保險絲 / 武裝開關電壓顯示（VF / VA）
 切換焦點頻道不再摧毀另一頻道的圖表與統計
 火工品按鈕在確認態不再變寬
 兩條重複狀態列合併為一行
-
-1.3.0  (2026-07-24)
-遠端 RECAL：一鍵重設火箭端氣壓零點 + 地面端姿態歸零
-火工品閉環：下行開傘確認、ARMED 回讀、格式錯誤狀態、VID/PID 辨識
-```
-### 1.2
 ```
 
-1.2.0  (2026-07-21 ~ 07-22)
+### v3.1
+```
+v3.1  (2026-07-21 ~ 07-22)
 雙板熱備援：/arm_all /dpl_all /abg_all 廣播到兩塊板
 ch2 實際上線（原本 _all 只打得到一塊板）
 部分發火告警措辭修正（單板成功仍能安全落地）
 雙頻道高度曲線同框比較
 requirements.txt 補 PyOpenGL
 ```
-### 1.1
-```
 
-1.1.0  (2026-07-19 ~ 07-21)
+### v3.0
+```
+v3.0  (2026-07-19 ~ 07-20)   ← 已發布 release「兩通道獨立」
 改接真實航電：LoRa communicator + 自動重連
 遙測改純 ASCII 直解析（JSON 格式廢棄）
 ZMQ 多進程架構（GUI 崩潰不影響遙測儲存）
 地圖視覺化、飛行階段追蹤、mock 遙測工具
 ```
-### 1.0
+
+### 1.0（micro:bit 原型時代）
 ```
 
 1.0.5
@@ -224,14 +236,20 @@ GUI 更新
 - [x] 使用者停止功能 — `/disconnect` 指令
 - [x] 讀取序列埠未捕獲錯誤導致視窗退出 — `stop_event` + 重連迴圈，
       並修掉 `FileNotFoundError` 後 break 造成 100% CPU 的鎖死
+- [x] 折線圖分析 — 即時統計標籤（最大高度 / 最大偏角 / 當前偏角 / 垂直速度）、
+      階段事件自動打標（三張圖 + 地圖同步，`main_window.py:994`）、
+      雙頻道疊圖比較（`alt_overlays`）
 
 ### 進行中 / 未完成
-- [ ] **建立測試套件**（`tests/`）— 目前整個 repo 沒有任何測試。最該先寫的是
-      「直接讀火箭端 `main.c` 的 printf 格式字串去比對本端 regex」那支，
-      韌體改格式時能當場抓到本端脫節
 - [ ] **`settings.json` 不該入庫** — 機器專屬設定卻被版控，兩人各改各的
       COM port 會在每次合併互相覆蓋。應改成 gitignore + `settings.example.json`
-- [ ] 折線圖分析 — 目前只有極值統計，沒有趨勢判讀或事件自動標記
+- [ ] 🔴 **`communicator.py` sentinel 毒化** — `stop()` 先把 `running=False`
+      再 `put(None)`，consumer 可能在兩者之間就退出，那顆 sentinel 留在 queue；
+      而 `start()` 不重建 queue → 下一次的 parser thread 第一次 `get()` 就
+      `break` 當場死掉。**實測 20 次 stop→start 命中 2 次（10%）**。
+      症狀是完全靜默：序列埠照讀、raw log 照長，但 GUI 一筆都收不到、無錯誤訊息。
+      觸發途徑：GUI 的 `set_port` / `set_baud` / `reconnect`。
+      修法：`start()` 裡加一行 `self.data_queue = queue.Queue()`
 - [ ] `doc/architecture.md` 仍描述「JSON 格式」與 micro:bit，需同步改寫
 - [ ] `doc/1.png` ~ `3.png` 是舊版 GUI 截圖
 - [ ] `doc/health_check_report.md` 列的高風險項目部分已修（ZMQ 執行緒安全、
