@@ -352,6 +352,16 @@ class MainWindow(QMainWindow):
         self.global_auto_cb.stateChanged.connect(_apply_auto)
         row.addWidget(self.global_auto_cb)
 
+        # ── 新增: 隱藏 Port 失敗與重試日誌核取方塊 ──
+        self.hide_port_err_cb = QCheckBox("隱藏 Port 重試")
+        self.hide_port_err_cb.setChecked(False)
+        self.hide_port_err_cb.toggled.connect(self._on_hide_port_err_toggled)
+        row.addWidget(self.hide_port_err_cb)
+
+    def _on_hide_port_err_toggled(self, checked: bool):
+        if hasattr(self, 'log_display') and self.log_display:
+            self.log_display.set_hide_port_errors(checked)
+
     @staticmethod
     def _vsep():
         sep = QLabel("┃")
@@ -467,6 +477,15 @@ class MainWindow(QMainWindow):
                     target=lambda: self.send_backend_command("disconnect", []),
                     daemon=True
                 ).start()
+            elif cmd in ("/hide_retry", "/hideretry"):
+                if not args:
+                    new_state = not self.hide_port_err_cb.isChecked()
+                else:
+                    arg = args[0].lower()
+                    new_state = arg in ("on", "true", "1")
+                self.hide_port_err_cb.setChecked(new_state)
+                status_str = "ENABLED" if new_state else "DISABLED"
+                self.logger.info(f"Hiding port retry logs is now {status_str}")
             elif cmd == "/reset-angle":
                 if self.latest_data:
                     self.angle_deviation = self.latest_data.direction
