@@ -7,13 +7,13 @@
 ## 1. 系統概述 (System Overview)
 
 本專案是一個基於 **PyQt6** 開發的火箭地面站即時監控軟體。其主要職責為：
-1. **序列埠通訊**：透過 `pyserial` 從地面接收端（如 Micro:bit、LoRa 接收模組）讀取火箭傳回的即時遙測數據（JSON 格式）。
+1. **序列埠通訊**：透過 `pyserial` 從地面接收端（`rocket-system/firmware-ground`：STM32F411 + E22-900T22D，**純透傳橋接、不解析**）讀取火箭傳回的即時遙測數據（**空格分隔的 ASCII**，不是 JSON）。
 2. **多線程處理**：使用獨立的背景線程進行串列埠讀取與資料解析，避免阻礙 GUI 主線程。
 3. **即時數據可視化**：
    - 使用 `pyqtgraph` 繪製實時的姿態折線圖（Pitch, Roll, Direction）。
    - 使用 `PyOpenGL` 進行 3D 立方體旋轉模擬，即時反應火箭姿態變化。
    - 地圖經緯度定位與狀態任務階段顯示。
-4. **本地數據持久化**：自動將接收到的數據同步保存為 CSV 及 JSON 格式，便於後續分析。
+4. **本地數據持久化**：解析後寫 CSV，同時由 `_read_serial` 逐行落地一份**未解析的 raw log** —— 解析器有問題時仍可回頭重解。
 
 ---
 
@@ -25,7 +25,7 @@
 graph TD
     subgraph BackendProcess [後端進程 - Telemetry Daemon]
         Comm[SerialCommunicator] -->|生產/消費隊列| Queue[queue.Queue]
-        Queue --> Parser[JSON/ASCII Parser]
+        Queue --> Parser[ASCII Parser]
         Parser -->|建立| SD[SensorData Dataclass]
         
         SD -->|寫入| CSV[CsvDataStorage]
@@ -62,13 +62,14 @@ graph TD
   - `LogData`: 地面站日誌數據結構。
 - **[communicator.py](file:///d:/Document_J/code/rocket_system_ground_side/src/core/communicator.py)**:
   - `SerialCommunicator`: 通訊核心。
-  - 啟動兩個背景線程：`_read_serial`（讀取序列埠 raw 數據並存入 thread-safe 佇列）與 `_process_data`（從佇列取出並解析 JSON 轉換成 `SensorData` 物件）。
+  - 啟動兩個背景線程：`_read_serial`（讀序列埠 raw 數據存入 thread-safe 佇列）與 `_process_data`（從佇列取出、解析 ASCII 轉成 `SensorData`）。
+  - ⚠ `stop()` 用 `None` 當 sentinel 喚醒阻塞中的 consumer，`start()` **每次都重建佇列** —— 否則上一輪沒被消費掉的 sentinel 會殺死下一輪的 parser（回歸測試 `tests/test_sentinel_poisoning.py`）。
   - 具備自動斷線重連機制 (`_reconnect`)。
 
 ### 3.2 儲存模組 (`src/storage`)
 - **[base.py](file:///d:/Document_J/code/rocket_system_ground_side/src/storage/base.py)**: 定義儲存抽象基類 `DataStorage`。
 - **[csv_storage.py](file:///d:/Document_J/code/rocket_system_ground_side/src/storage/csv_storage.py) & [json_storage.py](file:///d:/Document_J/code/rocket_system_ground_side/src/storage/json_storage.py)**: 
-  分別實現將資料寫入 CSV 檔案與 JSON 檔案。
+  將解析後的資料寫入 CSV（欄位見 `storage/csv_storage.py`）。
 - **[storage_observer.py](file:///d:/Document_J/code/rocket_system_ground_side/src/storage/storage_observer.py)**: 
   繼承自 `DataObserver`。當收到新遙測資料時，自動呼叫對應的儲存類別將資料寫入本地磁碟（如 `all_data_sensor.csv`）。
 
@@ -100,14 +101,14 @@ sequenceDiagram
     participant MW as MainWindow (GUI 主線程)
     participant GL as CubeGLWidget (OpenGL)
 
-    HW ->> SC: 傳送原始 JSON 字串 \n(例: {"rotationRoll":12.5,...})
+    HW ->> SC: 傳送 ASCII 遙測行(例: T28386 SQ42 AX+0.007 ... ST:0 MOD:F)
     Note over SC: _read_serial 執行緒讀取並加入佇列
-    SC ->> SC: _process_data 執行緒解碼與 JSON 解析
+    SC ->> SC: _process_data 執行緒解碼與欄位前綴解析
     SC ->> SC: 轉換為 SensorData 物件
     
     par 通知儲存觀察者
         SC ->> SO: on_data_received(SensorData)
-        SO ->> SO: 寫入 CSV/JSON 檔案
+        SO ->> SO: 寫入 CSV 檔案
     and 通知 GUI 觀察者
         SC ->> QO: on_data_received(SensorData)
         QO ->> MW: 發射 data_received 訊號 (跨線程 Qt Signal)
@@ -129,25 +130,30 @@ sequenceDiagram
 
 地面站支援兩種序列埠接收格式，並在內部以 ZMQ IPC 序列化傳輸：
 
-### 5.1 序列埠輸入協定 (Serial Ingestion Protocols)
+### 5.1 序列埠輸入協定 (Serial Ingestion Protocol)
 
-後端守護進程能動態識別並相容解析以下兩種格式：
-1. **新版優化 ASCII 格式**（詳細規格請參閱 [telemetry_format.md](file:///d:/Document_J/code/rocket_system_ground_side/doc/telemetry_format.md)）：
-   使用空格分隔，Key-Value 前綴。範例如下：
-   ```text
-   T28386 AX+0.007 AY+0.026 AZ+0.978 GX+6.09 GY-1.05 GZ-2.80 P997.92 RH-0.1 KH-0.1 VZ+0.00 GA0.98 ST:0 MOD:E GPS:1,8 C:0 LAT+25.04213 LON+121.53489
-   ```
-2. **舊版 JSON 格式**：
-   ```json
-   {
-     "rotationRoll": 12.5,
-     "rotationPitch": -5.2,
-     "direction": 180.0,
-     "stage": 2,
-     "failedTasks": [],
-     "location": [25.0339, 121.5645]
-   }
-   ```
+**只有一種格式**：空格分隔、Key 緊貼數值（沒有 `=`）、以 CRLF 結尾的 ASCII。
+
+```text
+T28386 SQ42 AX+0.007 AY+0.026 AZ+0.978 GX+6.09 GY-1.05 GZ-2.80 P997.92 RH-0.1 KH-0.1 VZ+0.00 GA0.98 ST:0 MOD:F GPS:1,8 C:0 VF8.12 VA7.98 LAT+22.17483 LON+120.89272
+```
+
+事件訊息另走 `MSG <LEVEL> <CONTENT>` 一行。
+
+完整欄位定義、狀態碼、模組旗標見 [telemetry_format.md](./telemetry_format.md)。
+權威來源是韌體 `firmware-rocket/Core/Src/main.c` 的 `lora_pkt` snprintf；
+`tests/test_crossrepo_protocol.py` 直接讀那份格式字串來比對，韌體改格式會當場叫。
+
+> 早期的 `telemetry:{json}`（micro:bit 原型時代）已於 2026-07 完全廢棄，解析器不再接受。
+> 本節在 2026-07-30 前仍把它列為「支援的第二種格式」。
+
+**解析器刻意要做的兩件事**（都是實際踩過的坑）：
+
+1. **截斷幀整幀丟棄** —— 缺 `ST`/`MOD`/`GA` 任一欄即丟。RF 切掉尾巴的封包若被補 0
+   收下，會產生假的 `stage=0`，而那會重設 stage 邊緣偵測基準，讓下一筆真封包的
+   `ST:2` 看起來像「剛轉入開傘」→ 在沒有新證據的情況下確認一道待確認的開傘指令。
+2. **宣稱定位卻沒有座標 → 降級 `NO_FIX`** —— 舊碼會靜默套用 (25.0, 121.5) 也就是
+   台北，並在地圖上畫成有效定位。落海搜救時那是災難性誤導。
 
 ### 5.2 行程間通訊格式 (ZMQ IPC JSON Format)
 

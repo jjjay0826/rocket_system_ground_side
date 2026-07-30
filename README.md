@@ -39,8 +39,9 @@ GUI 關掉後 backend daemon 仍會繼續收資料寫 CSV —— 這是多進程
 **GUI 崩潰不會弄丟遙測**。
 
 > [!IMPORTANT]
-> `settings.json` 的 COM port 是**機器專屬**的，但目前有被版控。
-> 從對方 fork 合併過來時會被覆蓋，發射前務必確認一次。
+> `settings.json` **不入庫**（每台電腦的 COM port 不同）。第一次跑會用
+> `src/utils/settings.py` 的 `DEFAULT_CHANNELS`；用 GUI 的 `/port COM12` 改一次
+> 就會自動寫回。範本見 `settings.example.json`。
 
 > [!NOTE]
 > 地面接收硬體是 `rocket-system/firmware-ground`（STM32F411 + E22-900T22D），
@@ -239,14 +240,14 @@ GUI 更新
 - [x] `communicator.py` sentinel 毒化 — `start()` 改為每次重建 `data_queue`。
       舊碼在 GUI 改 COM port / 鮑率 / 重連後有約 10% 機率讓解析執行緒無聲死亡
       （回歸測試 `tests/test_sentinel_poisoning.py`）
+- [x] `settings.json` 不再入庫 — 已 gitignore，範本留 `settings.example.json`；
+      缺檔時 `settings.py` 的 `DEFAULT_CHANNELS` 接手，`/port` 改一次會自動寫回
+- [x] `doc/architecture.md` 對齊實況 — 移除 micro:bit / JSON 時代的描述
 - [x] 折線圖分析 — 即時統計標籤（最大高度 / 最大偏角 / 當前偏角 / 垂直速度）、
       階段事件自動打標（三張圖 + 地圖同步，`main_window.py:994`）、
       雙頻道疊圖比較（`alt_overlays`）
 
 ### 進行中 / 未完成
-- [ ] **`settings.json` 不該入庫** — 機器專屬設定卻被版控，兩人各改各的
-      COM port 會在每次合併互相覆蓋。應改成 gitignore + `settings.example.json`
-- [ ] `doc/architecture.md` 仍描述「JSON 格式」與 micro:bit，需同步改寫
 - [ ] `doc/1.png` ~ `3.png` 是舊版 GUI 截圖
 - [ ] `doc/health_check_report.md` 列的高風險項目部分已修（ZMQ 執行緒安全、
       重連 CPU 鎖死），需標注哪些還在
