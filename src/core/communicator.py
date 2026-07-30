@@ -29,6 +29,7 @@ class SerialCommunicator:
         self.max_retries = 10000 
         self.retry_interval = 5  
         self.raw_log_filepath: Optional[str] = None
+        self._raw_fh = None          # 保持開啟的 raw log handle（見 _read_serial）
         self.was_connected = False
 
 
@@ -100,14 +101,29 @@ class SerialCommunicator:
                     data = self.serial.readline()
                     if data:
                         # 🛡️ 實作防禦性 Raw Log 寫入
-                        if hasattr(self, 'raw_log_filepath') and self.raw_log_filepath:
+                        # ★2026-07-31：保持開檔，不要每一行都 open/close。
+                        # 這段跑在**唯一的序列埠讀取執行緒**裡。原本每收到一行
+                        # （2Hz × 2 頻道）就重新開檔、寫入、flush、關檔 —— 只要
+                        # 防毒掃描、磁碟忙碌或檔案系統停頓，_read_serial 就無法
+                        # 回去讀 COM port，OS 的 UART buffer 填滿之後開始丟遙測。
+                        # 而 SD 已知不可靠，遙測是唯一可靠的資料來源。
+                        #
+                        # 沒有改成獨立 writer thread：發射前一天動執行緒架構風險
+                        # 太高。保持開檔已經拿掉絕大部分成本（open/close 是系統
+                        # 呼叫，write 到 page cache 幾乎不落盤）。
+                        if self.raw_log_filepath:
                             try:
-                                with open(self.raw_log_filepath, "ab") as f:
-                                    f.write(data)
-                                    # 不需要強制每次都 os.fsync，用 standard flush 兼顧效能與安全
-                                    f.flush()
+                                if self._raw_fh is None:
+                                    self._raw_fh = open(self.raw_log_filepath, "ab", buffering=0)
+                                self._raw_fh.write(data)
                             except Exception as e:
                                 self.logger.error(f"Raw log write error: {e}")
+                                try:
+                                    if self._raw_fh:
+                                        self._raw_fh.close()
+                                except Exception:
+                                    pass
+                                self._raw_fh = None   # 下一行重開，不要卡死在壞掉的 handle
                         self.data_queue.put(data)
                 else:
                     self.logger.info("Serial connection is not active. Initiating connection...")
@@ -226,6 +242,14 @@ class SerialCommunicator:
                 self.serial.close()
             except Exception as e:
                 self.logger.error(f"Error closing serial during stop: {e}")
+
+        # raw log handle 收乾淨（換埠時 raw_log_filepath 會變）
+        if self._raw_fh is not None:
+            try:
+                self._raw_fh.close()
+            except Exception:
+                pass
+            self._raw_fh = None
 
         # 💡 放入 Sentinel (None) 喚醒正在 Queue.get 阻塞等待的 process_thread
         self.data_queue.put(None)

@@ -658,6 +658,8 @@ class MainWindow(QMainWindow):
                     daemon=True
                 ).start()
             elif cmd == "/dpl":
+                if self._ascent_guard([self.focus_channel], "dpl"):
+                    return
                 self.logger.warning("🚨 [EMERGENCY] Transmitting remote FORCE PARACHUTE DEPLOYMENT command...")
                 self.broadcast_event("[CMD] DPL", "#D500F9")
                 self._register_confirm([self.focus_channel], "dpl")
@@ -681,6 +683,8 @@ class MainWindow(QMainWindow):
                     daemon=True
                 ).start()
             elif cmd == "/dpl_all":
+                if self._ascent_guard(self.channel_ids, "dpl"):
+                    return
                 self.logger.warning("🚨 [EMERGENCY] Broadcasting FORCE PARACHUTE DEPLOY to ALL boards...")
                 self._register_confirm(self.channel_ids, "dpl")
                 threading.Thread(
@@ -1606,6 +1610,43 @@ class MainWindow(QMainWindow):
             self.logger.warning(
                 f"⚠ [{ch}] 氣壓基準漂移 {drift:.1f} m({hpa:.1f} hPa)"
                 f"——建議按「校準 ALL」重設零點")
+
+
+    # ── 上升段的 /dpl 二次確認 ────────────────────────────────────────────
+    # 韌體只擋離架後前 10 秒，但頂點在 13.5~16.7 秒（3.0.8 的 81 組模擬）。
+    # 也就是第 10 秒到頂點之間，文字指令 /dpl 會被火箭接受 —— 那時仍在上升、
+    # 動壓最大，開傘等於解體。
+    #
+    # 但**不能無條件加確認**：真正的緊急情境（過了頂點、傘沒開）也是 stage 1，
+    # 那時多一道手續是在偷走你最缺的東西。
+    # 所以只擋「還在往上」這個唯一會出事的情況 —— 用遙測的 vz 判斷，
+    # 下降中直接送出，行為與現在完全相同。
+    _ASCENT_VZ = 2.0        # m/s，超過視為仍在上升
+
+    def _ascent_guard(self, chans, action: str) -> bool:
+        """回傳 True = 擋下來了（要求再輸入一次）。下降中或無資料時放行。
+
+        用焦點頻道的 vz 判斷就夠 —— 兩塊板裝在**同一枚火箭**上，看到的是
+        同一條軌跡。沒有資料時一律放行（不知道就不要擋緊急指令）。"""
+        d = self.latest_data
+        if d is None:
+            self._pending_ascent = None
+            return False
+        if not (getattr(d, "stage", 0) == 1 and getattr(d, "vz", 0.0) > self._ASCENT_VZ):
+            self._pending_ascent = None
+            return False
+        rising = [f"+{d.vz:.1f} m/s"]
+        key = (action, tuple(chans))
+        if getattr(self, "_pending_ascent", None) == key:
+            self._pending_ascent = None
+            self.logger.warning(f"⚠ 已確認：在上升段送出 {action.upper()}")
+            return False
+        self._pending_ascent = key
+        self.logger.error(
+            f"🛑 火箭仍在上升（{', '.join(rising)}）—— 上升段開傘會解體。"
+            f"確定要送就再輸入一次同樣的指令。")
+        self.broadcast_event("[🛑 上升中，再按一次確認]", "#FF3B30")
+        return True
 
     def _batt_level(self, vf: float) -> str:
         """2S 鋰電電壓分級。刻意不換算成百分比——鋰電在變動負載下的
