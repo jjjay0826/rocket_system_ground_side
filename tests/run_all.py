@@ -26,7 +26,7 @@ SUITES = [
     ("focus",     "test_gui_focus.py",          False),
     ("reject",    "test_reject_dispatch.py",    False),
     ("link",      "test_link_battery.py",       False),
-    ("sentinel",  "test_sentinel_poisoning.py", True),   # 🔴 見檔案開頭說明
+    ("sentinel",  "test_sentinel_poisoning.py", False),  # 2026-07-30 已修，見檔案開頭
 ]
 
 

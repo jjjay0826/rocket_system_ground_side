@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""🔴 已知缺陷的重現 —— 這支目前預期會失敗，修好之前不要刪。
+"""sentinel 毒化的回歸測試（缺陷已於 2026-07-30 修復）。
+
+改壞 start() 就會紅。以下是它當初的樣子：
 
 communicator.py 的 stop() 順序：
     第 199 行  self.running = False
@@ -19,9 +21,13 @@ queue 從此無上限積壓。
     set_baud   :119/121    GUI 改 baudrate
     reconnect  :126/127    GUI 手動重連
 
-修法：start() 裡加一行
+修法（已套用）：start() 裡加一行
+
     self.data_queue = queue.Queue()
-不管競態怎麼跑都對，而且語意上也更正確 —— 換了埠不該重播前一個埠的殘留位元組。
+
+修在 start() 而不是去調 stop() 的順序，是因為根因不是「sentinel 有沒有被領走」，
+而是「上一輪的殘留會不會被下一輪看到」—— 只要 consumer 因為任何理由提前退出，
+殘留都會傳下去。重建佇列是無條件正確的。
 """
 import sys, time
 from _common import Checker, REPO
@@ -44,7 +50,7 @@ class FakeSerial:
 
 
 def run():
-    c = Checker("communicator sentinel 毒化（已知缺陷，預期失敗）")
+    c = Checker("communicator sentinel 毒化（回歸測試）")
     from src.core.communicator import SerialCommunicator
 
     dead = 0
@@ -95,5 +101,4 @@ def run():
 
 if __name__ == "__main__":
     ok = run()
-    print("（這支目前預期失敗；修好 communicator.py 之後應轉綠）")
     sys.exit(0 if ok else 1)

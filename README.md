@@ -236,6 +236,9 @@ GUI 更新
 - [x] 使用者停止功能 — `/disconnect` 指令
 - [x] 讀取序列埠未捕獲錯誤導致視窗退出 — `stop_event` + 重連迴圈，
       並修掉 `FileNotFoundError` 後 break 造成 100% CPU 的鎖死
+- [x] `communicator.py` sentinel 毒化 — `start()` 改為每次重建 `data_queue`。
+      舊碼在 GUI 改 COM port / 鮑率 / 重連後有約 10% 機率讓解析執行緒無聲死亡
+      （回歸測試 `tests/test_sentinel_poisoning.py`）
 - [x] 折線圖分析 — 即時統計標籤（最大高度 / 最大偏角 / 當前偏角 / 垂直速度）、
       階段事件自動打標（三張圖 + 地圖同步，`main_window.py:994`）、
       雙頻道疊圖比較（`alt_overlays`）
@@ -243,18 +246,10 @@ GUI 更新
 ### 進行中 / 未完成
 - [ ] **`settings.json` 不該入庫** — 機器專屬設定卻被版控，兩人各改各的
       COM port 會在每次合併互相覆蓋。應改成 gitignore + `settings.example.json`
-- [ ] 🔴 **`communicator.py` sentinel 毒化** — `stop()` 先把 `running=False`
-      再 `put(None)`，consumer 可能在兩者之間就退出，那顆 sentinel 留在 queue；
-      而 `start()` 不重建 queue → 下一次的 parser thread 第一次 `get()` 就
-      `break` 當場死掉。**實測 20 次 stop→start 命中 2 次（10%）**。
-      症狀是完全靜默：序列埠照讀、raw log 照長，但 GUI 一筆都收不到、無錯誤訊息。
-      觸發途徑：GUI 的 `set_port` / `set_baud` / `reconnect`。
-      修法：`start()` 裡加一行 `self.data_queue = queue.Queue()`
 - [ ] `doc/architecture.md` 仍描述「JSON 格式」與 micro:bit，需同步改寫
 - [ ] `doc/1.png` ~ `3.png` 是舊版 GUI 截圖
 - [ ] `doc/health_check_report.md` 列的高風險項目部分已修（ZMQ 執行緒安全、
       重連 CPU 鎖死），需標注哪些還在
-- [ ] `communicator.py` 的 sentinel 值可能被遙測資料污染（低優先）
 
 ### 發射前必辦（火箭端 repo）
 - [ ] 關閉 `REMOTE_CMD_UNRESTRICTED` 後重編重燒 — 目前火工品指令**沒有任何閘門**

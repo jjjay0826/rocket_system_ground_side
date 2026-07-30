@@ -186,6 +186,27 @@ class SerialCommunicator:
         self.running = True
         self.stop_event.clear()
 
+        # ★ 每次啟動都換一個全新的佇列（2026-07-30）
+        #
+        # stop() 是先 `self.running = False`、再 `put(None)` 送 sentinel。
+        # _process_data 的迴圈條件是 `while self.running`，所以在這兩步之間
+        # consumer 可能剛拆完一筆、回頭看旗標就直接退出 —— 那顆 sentinel
+        # 沒人消費，留在佇列裡。以前 data_queue 只在 __init__ 建立一次，
+        # 於是下一輪的 parser thread 第一次 get() 就拿到上一輪的 None，
+        # `break`，當場死掉。實測 20 次 stop→start 命中 1~2 次。
+        #
+        # 症狀是完全靜默：read thread 照讀、raw log 檔案照長，但畫面一筆都
+        # 不進，而且沒有任何錯誤訊息（break 是正常退出）。佇列還會無上限積壓。
+        # 觸發途徑是 GUI 的 set_port / set_baud / reconnect，全是操作員動作。
+        #
+        # 修在這裡而不是去調 stop() 的順序：根因不是「sentinel 有沒有被領走」，
+        # 而是「上一輪的殘留會不會被下一輪看到」。只要 consumer 因為任何理由
+        # 提前退出，殘留就會傳下去。start() 重建佇列是無條件正確的。
+        # 語意上也更對 —— 換了 COM port，前一個埠殘留的位元組不該被當成
+        # 新埠的資料解析。stop() 會 join 兩條執行緒才返回，所以不存在
+        # 「舊 thread 寫進新佇列」的空窗。
+        self.data_queue = queue.Queue()
+
         self.read_thread = threading.Thread(target=self._read_serial)
         self.process_thread = threading.Thread(target=self._process_data)
 
