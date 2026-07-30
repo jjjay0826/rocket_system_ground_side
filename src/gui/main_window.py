@@ -35,6 +35,7 @@ class MainWindow(QMainWindow):
         self.max_total_accel = 0.0
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
+        self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self.calib_q = None
         
         # ─── 快速軸向對應設定區 (Sensor Axis Mapping Configuration) ───
@@ -84,7 +85,8 @@ class MainWindow(QMainWindow):
         self.ch_prev_stage = {}       # ch -> 上一筆 stage(偵測「轉入」開傘的邊緣)
         self.ch_seq = {}              # ch -> 最近收到的序號(deque):量化掉包率
         self.ch_link = {}             # ch -> (到達率 0~1, 樣本數)
-        self._prev_batt_level = {}    # ch -> "ok"/"low"/"crit":只在惡化時警告
+        self._prev_batt_level = {}
+        self._prev_drift_level = {}   # ch -> 氣壓基準漂移等級,只在惡化時告警    # ch -> "ok"/"low"/"crit":只在惡化時警告
 
         self.latest_data = None
 
@@ -568,6 +570,7 @@ class MainWindow(QMainWindow):
         self.max_deviation_angle = 0.0
         self.max_total_accel = 0.0
         self.max_height = 0.0
+        self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self.ui.gl_label.setText(
             "當前偏角: 0.0° | 最大偏角: 0.0°"
         )
@@ -767,6 +770,7 @@ class MainWindow(QMainWindow):
         self.max_total_accel = 0.0
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
+        self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self.calib_q = None
         self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])
         
@@ -788,6 +792,7 @@ class MainWindow(QMainWindow):
         self.ch_seq = {}
         self.ch_link = {}
         self._prev_batt_level = {}
+        self._prev_drift_level = {}
         # F3-A 覆疊曲線一併清:start_time 已重置,舊 x 基準的點續留會錯位
         for ov in getattr(self, "alt_overlays", {}).values():
             ov["kh"].reset()
@@ -1148,6 +1153,25 @@ class MainWindow(QMainWindow):
         is_new_event, ev_name, ev_color = self.stage_display.update(data.stage, data.timestamp)
         if is_new_event:
             self.broadcast_event(f"[{ev_name}]", ev_color)
+
+        # ── 地面站自行推導的事件（火箭端的 5 個狀態刻意不含這些）──────────
+        # 資料本來就在遙測裡，推導出來標成「地面推導」與火箭回報視覺上分開。
+        # 火箭端不加狀態的理由：那 5 個是開傘決策實際在用的，多一個就要
+        # 重新稽核所有 flight_state 比較，賽前不值得動。
+        if data.stage == 1:
+            # BURNOUT：合加速度跌回 1.15g 以下 = 進入慣性滑行（與韌體同一門檻）
+            if (not math.isnan(getattr(data, "total_accel", float("nan")))
+                    and data.total_accel < 1.15
+                    and getattr(self, "_seen_boost", False)):
+                if self.stage_display.mark_derived("BURNOUT", data.timestamp, "#FF9100"):
+                    self.broadcast_event("[BURNOUT]", "#FF9100")
+            if getattr(data, "total_accel", 0.0) > 1.5:
+                self._seen_boost = True
+        elif data.stage == 2:
+            # APOGEE：進入開傘的那一刻，峰值已經確定
+            if self.stage_display.mark_derived(
+                    f"APOGEE {self.max_height:.0f}m", data.timestamp, "#FFD600"):
+                self.broadcast_event(f"[APOGEE {self.max_height:.0f}m]", "#FFD600")
         # Update health status labels based on failedTasks (0:BMP, 1:IMU, 2:LoRa, 3:SD)
         health_map = [
             (self.ui.health_bmp, "BMP"),
@@ -1200,6 +1224,8 @@ class MainWindow(QMainWindow):
         self._track_pyro_power(topic, data)
         # 鏈路品質:用火箭的發送序號跳號量化掉包
         self._track_link_quality(topic, data)
+        # 氣壓基準漂移:地面上 RH 應該 ≈0,不是 0 就是 ref_press 過期了
+        self._track_baro_drift(topic, data)
 
         # 收包瞬間該通道 LED 亮綠脈衝(下一輪 check_heartbeats 200ms 內覆蓋回狀態色)。
         # Backend Offline 狀態不閃:命令路徑疑似死亡時不給「健康綠」的假象。
@@ -1520,6 +1546,66 @@ class MainWindow(QMainWindow):
     _PYRO_LIVE_V = 5.0    # 高於此 = 該段線路確實帶電
     _PYRO_LOW_V  = 7.0    # 低於此 = 電量偏低(約剩 20%),發射前應更換
     _PYRO_CRIT_V = 6.6    # 低於此 = 電量危險(約剩 5%),不應繼續飛
+
+    # ── 氣壓基準漂移門檻(公尺)。換算:1 hPa ≈ 8.3 m ─────────────────────
+    _BARO_DRIFT_WARN = 5.0    # 該重新校準了
+    _BARO_DRIFT_HIGH = 10.0   # 誤判離架已【無法撤銷】(火箭端 REVOKE_ALT_M)
+    _BARO_DRIFT_CRIT = 20.0   # C 備援的 20m 地面保護【已失效】(DEPLOY_PEAK_MIN_M)
+
+    def _track_baro_drift(self, ch: str, data):
+        """地面待機時,RH 顯示的數字就是 ref_press 的漂移量。
+
+        火箭沒動,rel_alt = 44330·(1 − (P/ref_press)^0.1903) 卻不是 0,
+        就只可能是開機時記下的基準已經過期(天氣變化、在發射台等太久)。
+
+        這不影響開傘判斷——cond_A 判的是「低於峰值 10m」,是**差值**,基準
+        平移會抵消掉。但火箭端有兩道判**絕對值**的閘門會被打壞:
+
+            漂 10 m(1.2 hPa) → 誤判離架後無法撤銷(rel_alt < REVOKE_ALT_M 永不成立)
+            漂 20 m(2.4 hPa) → C 備援的 20m 地面保護失效(peak 一開始就超標)
+
+        在發射台等幾小時就可能漂到。處置很簡單:按「校準 ALL」。
+        只在 IDLE(stage 0)判定——飛起來之後 RH 本來就該是大數字。
+        """
+        if getattr(data, "stage", -1) != 0:
+            self._prev_drift_level.pop(ch, None)
+            return
+        try:
+            drift = abs(float(data.rel_height))
+        except (TypeError, ValueError):
+            return
+        if drift >= self._BARO_DRIFT_CRIT:
+            lvl = "crit"
+        elif drift >= self._BARO_DRIFT_HIGH:
+            lvl = "high"
+        elif drift >= self._BARO_DRIFT_WARN:
+            lvl = "warn"
+        else:
+            lvl = "ok"
+
+        prev = self._prev_drift_level.get(ch)
+        if lvl == prev:
+            return                      # 同級不重複洗版
+        self._prev_drift_level[ch] = lvl
+        if lvl == "ok":
+            if prev is not None:
+                self.logger.info(f"✅ [{ch}] 氣壓基準已歸零({drift:.1f} m)")
+            return
+        hpa = drift / 8.3
+        if lvl == "crit":
+            self.logger.error(
+                f"🔴 [{ch}] 氣壓基準漂移 {drift:.1f} m({hpa:.1f} hPa)"
+                f"——C 備援的 20m 地面保護已失效!發射前務必按「校準 ALL」")
+            self.broadcast_event(f"[🔴 {ch} 基準漂移 {drift:.0f}m]", "#FF3B30")
+        elif lvl == "high":
+            self.logger.error(
+                f"🟠 [{ch}] 氣壓基準漂移 {drift:.1f} m({hpa:.1f} hPa)"
+                f"——誤判離架後已無法撤銷。請按「校準 ALL」")
+            self.broadcast_event(f"[🟠 {ch} 基準漂移 {drift:.0f}m]", "#FF9100")
+        else:
+            self.logger.warning(
+                f"⚠ [{ch}] 氣壓基準漂移 {drift:.1f} m({hpa:.1f} hPa)"
+                f"——建議按「校準 ALL」重設零點")
 
     def _batt_level(self, vf: float) -> str:
         """2S 鋰電電壓分級。刻意不換算成百分比——鋰電在變動負載下的

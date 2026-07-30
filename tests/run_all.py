@@ -22,6 +22,7 @@ RESULTS = HERE / "_results"
 SUITES = [
     ("crossrepo", "test_crossrepo_protocol.py", False),
     ("parse",     "test_parse_and_zmq.py",      False),
+    ("stage",     "test_stage_names.py",        False),
     ("focus",     "test_gui_focus.py",          False),
     ("reject",    "test_reject_dispatch.py",    False),
     ("link",      "test_link_battery.py",       False),

@@ -83,6 +83,36 @@ def run():
     finally:
         logging.getLogger().removeHandler(h)
 
+    # ── 氣壓基準漂移告警（地面上 RH 就是漂移量）──
+    w.reset_gui_state()
+    w._prev_drift_level.clear()
+    hits2 = []
+
+    class Grab2(logging.Handler):
+        def emit(self, r): hits2.append(r.getMessage())
+
+    h2 = Grab2()
+    logging.getLogger().addHandler(h2)
+    try:
+        def feed_rh(rh, st=0):
+            w._track_baro_drift("ch1", SensorData.from_new_format(
+                frame(t=1, sq=1, rh=f"{rh}", st=st)))
+        feed_rh(0.5);  c.check("地面 RH=0.5m → 不告警", not hits2)
+        feed_rh(7.0);  c.check("★RH=7m → 建議重新校準",
+                               any("建議按" in x for x in hits2))
+        n2 = len(hits2)
+        feed_rh(7.5);  c.check("同級不重複洗版", len(hits2) == n2)
+        feed_rh(12.0); c.check("★RH=12m → 誤判離架無法撤銷",
+                               any("無法撤銷" in x for x in hits2))
+        feed_rh(25.0); c.check("★RH=25m → C 備援地面保護失效",
+                               any("20m 地面保護已失效" in x for x in hits2))
+        n3 = len(hits2)
+        feed_rh(300.0, st=1)
+        c.check("飛行中(stage≠0)不判定漂移", len(hits2) == n3,
+                "飛起來之後 RH 本來就該是大數字")
+    finally:
+        logging.getLogger().removeHandler(h2)
+
     w.reset_gui_state()
     c.check("reset 清空鏈路與電量狀態",
             not w.ch_seq and not w.ch_link and not w._prev_batt_level)
