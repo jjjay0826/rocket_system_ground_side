@@ -36,6 +36,7 @@ class MainWindow(QMainWindow):
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
+        self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
         self.calib_q = None
         
         # ─── 快速軸向對應設定區 (Sensor Axis Mapping Configuration) ───
@@ -621,6 +622,7 @@ class MainWindow(QMainWindow):
         self.max_total_accel = 0.0
         self.max_height = 0.0
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
+        self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
         self.ui.gl_label.setText(
             "當前偏角: 0.0° | 最大偏角: 0.0°"
         )
@@ -875,6 +877,7 @@ class MainWindow(QMainWindow):
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
+        self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
         self.calib_q = None
         self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])
         
@@ -1300,23 +1303,46 @@ class MainWindow(QMainWindow):
         # 資料本來就在遙測裡，推導出來標成「地面推導」與火箭回報視覺上分開。
         # 火箭端不加狀態的理由：那 5 個是開傘決策實際在用的，多一個就要
         # 重新稽核所有 flight_state 比較，賽前不值得動。
-        if data.stage == 1:
-            # BURNOUT：合加速度跌回 1.15g 以下 = 進入慣性滑行（與韌體同一門檻）
-            if (not math.isnan(getattr(data, "total_accel", float("nan")))
-                    and data.total_accel < 1.15
-                    and getattr(self, "_seen_boost", False)):
-                if self.stage_display.mark_derived(
-                        "BURNOUT", data.timestamp, "#FF9100",
-                        getattr(data, "timestamp_ms", None)):
-                    self.broadcast_event("[BURNOUT]", "#FF9100")
-            if getattr(data, "total_accel", 0.0) > 1.5:
+        # ★2026-08-01：原本 6 個推導列裡只有 BURNOUT 與 APOGEE 有人點亮，
+        # 其餘 4 列（ARMED / IGNITION / COASTING / TOUCHDOWN）永遠顯示「—」。
+        # 一直是「—」的列看起來像壞掉，而且會讓真正沒推導出來的情況失去意義。
+        # 這四個的資料本來就在遙測裡，補上。
+        ms = getattr(data, "timestamp_ms", None)
+        ga = getattr(data, "total_accel", float("nan"))
+
+        def derive(name, color):
+            if self.stage_display.mark_derived(name, data.timestamp, color, ms):
+                self.broadcast_event(f"[{name}]", color)
+
+        if data.stage == 0:
+            # IGNITION：推力起來的那一刻。★火箭自己看不到點火 —— 它的離架
+            # 偵測要 2.5g 持續 200ms，那時已經是點火後約 1.3 秒。但遙測在
+            # ST 還是 0 的時候就一直在送，地面站看得到 GA 先爬起來。
+            # 所以這是【量到的】，不是拿常數回推的。
+            if not math.isnan(ga) and ga > 1.5:
+                derive("IGNITION", "#00E676")
+        elif data.stage == 1:
+            # BURNOUT：合加速度跌回 1.15g 以下 = 推力結束（與韌體同一門檻）
+            if not math.isnan(ga) and ga < 1.15 and getattr(self, "_seen_boost", False):
+                derive("BURNOUT", "#FF9100")
+                # COASTING：推力結束的同一刻慣性上升就開始了。時間戳相同不是
+                # 冗餘 —— BURNOUT 是「推力沒了」，COASTING 是「開始純靠慣性」，
+                # 報告書上兩者要分開講。
+                derive("COASTING", "#FFC400")
+            if ga > 1.5:
                 self._seen_boost = True
         elif data.stage == 2:
             # APOGEE：進入開傘的那一刻，峰值已經確定
-            if self.stage_display.mark_derived(
-                    f"APOGEE {self.max_height:.0f}m", data.timestamp, "#FFD600",
-                    getattr(data, "timestamp_ms", None)):
-                self.broadcast_event(f"[APOGEE {self.max_height:.0f}m]", "#FFD600")
+            derive(f"APOGEE {self.max_height:.0f}m", "#FFD600")
+        elif data.stage == 3:
+            # TOUCHDOWN：觸地／觸水的瞬間。★這不等於 LANDED ——
+            # 韌體的 LANDED 要「靜止 10 秒」才成立，也就是【觸水後 10 秒】。
+            # 落海時真正要記下來的位置是觸水點，不是十秒後漂走的地方。
+            vz = getattr(data, "vz", 0.0)
+            if abs(vz) > 3.0:
+                self._seen_descent = True
+            elif getattr(self, "_seen_descent", False) and abs(vz) < 1.0:
+                derive("TOUCHDOWN", "#00E5FF")
         # Update health status labels based on failedTasks (0:BMP, 1:IMU, 2:LoRa, 3:SD)
         health_map = [
             (self.ui.health_bmp, "BMP"),
@@ -1617,6 +1643,12 @@ class MainWindow(QMainWindow):
             if not already:
                 self.logger.warning(f"🔓 [{ch}] Rocket confirms ARMED ({secs}s window)")
                 self.broadcast_event(f"[🔓 {ch} ARMED]", "#FF9100")
+                # ★階段序列的 ARMED 那一列：這是火箭【回讀】的解鎖確認，
+                # 不是地面站送出指令的時刻 —— 規範 4.6.7 要的就是回讀。
+                # 只認第一塊回報的板（mark_derived 自帶去重）。
+                self.stage_display.mark_derived(
+                    "ARMED", datetime.now(), "#FF9100",
+                    getattr(self.latest_data, "timestamp_ms", None))
         elif "MANUAL SAFE" in content or "ARM expired" in content:
             self.ch_armed_until.pop(ch, None)
         elif "Parachute deployed successfully" in content:

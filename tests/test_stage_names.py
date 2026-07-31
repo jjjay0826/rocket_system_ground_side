@@ -137,6 +137,25 @@ def run():
     c.check("★uptime 倒退（火箭重開）時退回牆上時鐘",
             "(T+15.00s)" in txt, f"實際 {txt.strip()}")
 
+    # ── ★六個推導列都必須有人點亮，不能永遠是「—」──────────────────
+    # 2026-08-01 之前只有 BURNOUT 與 APOGEE 有程式碼會去點亮，
+    # ARMED / IGNITION / COASTING / TOUCHDOWN 四列永遠顯示「—」。
+    # 一直是「—」的列看起來像壞掉，也讓「真的沒推導出來」失去意義。
+    mw = (REPO / "src" / "gui" / "main_window.py").read_text(encoding="utf-8")
+    for name in [n for n, _, s_ in FLIGHT_SEQUENCE if s_ == "gnd"]:
+        c.check(f"★推導列 {name} 有程式碼會點亮它",
+                f'"{name}"' in mw or f"'{name}'" in mw or f'f"{name} ' in mw,
+                "序列裡列了一格卻沒有人填，畫面上會永遠是「—」")
+
+    # 全部點亮之後，畫面上不該再有「—」
+    sd.reset()
+    sd.update(1, W, rocket_ms=10000)
+    for name in [n for n, _, s_ in FLIGHT_SEQUENCE if s_ == "gnd"]:
+        sd.mark_derived(name, W, "#000000", 11000)
+    c.check("★六列全部推導後畫面沒有「—」",
+            not any("—" in x for x in sd._labels()),
+            [x for x in sd._labels() if "—" in x])
+
     sd.reset()
     sd.update(9, t0)          # 越界：韌體真的改成 12 態時的行為
     c.check("越界的 ST 不會 IndexError，也不會畫出錯誤名稱",
