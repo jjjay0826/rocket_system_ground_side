@@ -255,10 +255,28 @@ class SerialCommunicator:
         self.data_queue.put(None)
 
         # 2. 安全等待線程退出
-        if self.read_thread:
-            self.read_thread.join()
-        if self.process_thread:
-            self.process_thread.join()
+        #
+        # ★2026-07-31：加上逾時。原本是無限期 join()。
+        #
+        # stop() 由 backend_daemon 的【指令回應執行緒】呼叫（set_port /
+        # set_baud / reconnect / disconnect 四條路都會）。那條執行緒卡住 =
+        # 這個頻道從此不再處理任何 GUI 指令 —— 包含 /arm 和 /dpl。
+        #
+        # 目前的路徑分析下 join 應該會在 1 秒內返回（serial timeout=1、
+        # stop_event 已 set、running 已 False），所以這不是已知會發生的
+        # 當機，而是把「萬一 Windows 的序列埠沒有被 close() 解除阻塞」
+        # 這個可能性，從【永久卡死】降級成【記一行 log 繼續走】。
+        # 緊急指令的通道不該有任何無限等待。
+        for _name, _th in (("read", self.read_thread),
+                           ("process", self.process_thread)):
+            if _th is None:
+                continue
+            _th.join(timeout=5.0)
+            if _th.is_alive():
+                self.logger.error(
+                    f"{_name} thread did not exit within 5s - continuing anyway. "
+                    f"Serial port may still be held; if reopening fails, "
+                    f"restart the backend for this channel.")
             
         self.logger.info("Serial communication stopped")
 

@@ -43,6 +43,10 @@ class ZmqReceiverThread(QThread):
 
          # 在 Socket 上設置接收超時時間 (200ms)，取代 Poller，避免 Windows 下 pyzmq.Poller.poll 發生記憶體存取衝突 (Access Violation)
         socket.setsockopt(zmq.RCVTIMEO, 200)
+        # ★2026-07-31：LINGER=0，否則下面收尾的 context.term() 可能永不返回，
+        # 關閉地面站時整個 process 掛在那裡不退出（要去工作管理員砍）。
+        # SUB socket 沒有要送的東西，丟棄未送訊息對它沒有任何損失。
+        socket.setsockopt(zmq.LINGER, 0)
 
         while not self.isInterruptionRequested():
             try:

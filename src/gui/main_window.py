@@ -258,6 +258,19 @@ class MainWindow(QMainWindow):
         socket = context.socket(zmq.REQ)
         socket.setsockopt(zmq.RCVTIMEO, 5000) # 5000 毫秒接收超時 (相容 4 連發 0.7s 間隔)
         socket.setsockopt(zmq.SNDTIMEO, 5000) # 5000 毫秒傳送超時
+        # ★2026-07-31：LINGER=0。
+        # 預設 LINGER 是 -1（無限），意思是 close() 之後 context.term() 會
+        # 【一直等到排隊中的訊息送出去為止】。而下面 finally 裡就是
+        # close() + term()：只要後端沒回應（recv 逾時走 zmq.error.Again），
+        # 那筆已送出但沒被取走的請求就永遠在佇列裡 → term() 永久阻塞。
+        #
+        # 這些呼叫跑在背景執行緒（/dpl 用 threading.Thread 發），所以畫面
+        # 不會凍住 —— 它只是每逾時一次就洩漏一條卡死的執行緒和一個
+        # ZMQ context（各自帶一條 I/O 執行緒）。發射台上後端沒起來、
+        # COM 拔錯孔的時候，一連按幾次就累積起來了。
+        # LINGER=0 = 關掉時直接丟棄未送出的訊息，term() 立刻返回。
+        # 對這裡是正確語意：那筆請求已經逾時了，補送也沒有意義。
+        socket.setsockopt(zmq.LINGER, 0)
         socket.connect(f"tcp://127.0.0.1:{zmq_cmd_port}")
 
         try:
