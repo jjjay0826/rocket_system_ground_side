@@ -14,6 +14,23 @@ from _common import Checker, firmware_repo, REPO
 sys.path.insert(0, str(REPO))
 
 
+def strip_c_comments(src):
+    """把 C 註解換成等長空白。斷言「某識別字已經不存在」時一定要先過這道，
+    否則留在註解裡的史料說明會讓測試永遠紅。"""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        if src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(" " if ch != "\n" else "\n" for ch in src[i:j])); i = j
+        elif src.startswith("//", i):
+            j = src.find("\n", i); j = n if j < 0 else j
+            out.append(" " * (j - i)); i = j
+        else:
+            out.append(src[i]); i += 1
+    return "".join(out)
+
+
 def run():
     c = Checker("跨 repo 協定：韌體格式 → 地面站解析")
     fw = firmware_repo()
@@ -106,9 +123,23 @@ def run():
     # ── 地面站據以自動確認火工品的 MSG 字串必須還在韌體裡 ──
     mw = (REPO / "src" / "gui" / "main_window.py").read_text(encoding="utf-8")
     for needle, why in (("Parachute deployed successfully", "確認遠端開傘"),
-                        ("Airbag inflation started", "確認氣囊"),
                         ("already deployed", "視為開傘證據")):
         c.check(f"「{needle}」兩端都有", needle in src and needle in mw, why)
+
+    # ── ★2026-07-31 氣囊移除：反向守衛 ──────────────────────────────
+    # 原本這裡驗的是「Airbag inflation started 兩端都有」。氣囊拆掉之後
+    # 該驗的是相反的事：兩端都不可以再有任何會【發火】的氣囊路徑。
+    c.check("韌體不再有氣囊充氣訊息", "Airbag inflation started" not in src,
+            "訊息還在＝airbag_fire_auto 或 /abg 的發火路徑沒拆乾淨")
+    c.check("地面站不再送出 abg", 'send_remote_cmd", ["abg"]' not in mw)
+    for dead in ("airbag_fire_auto", "abg_active"):
+        c.check(f"韌體無 {dead} 殘留", dead not in strip_c_comments(src),
+                "PA0 現在是傘迴路的一半，任何單獨拉 PA0 的路徑都是活雷")
+    # 反向：傘的兩支腳必須真的一起動
+    c.check("★點傘一律走 deploy_fire_on()（PA0+PA1 同時）",
+            "HAL_GPIO_WritePin(DEPLOY_PORT, DEPLOY_PIN, GPIO_PIN_SET)" not in src
+            and src.count("deploy_fire_on()") >= 6,
+            f"deploy_fire_on() 出現 {src.count('deploy_fire_on()')} 次（應 ≥6）")
 
     # 自動開傘的訊息**刻意不含** successfully，不該觸發下行確認
     auto = re.findall(r'"MSG SUCCESS Parachute deployed \([^"]*"', src)

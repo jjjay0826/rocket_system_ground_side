@@ -298,7 +298,9 @@ class MainWindow(QMainWindow):
                                 f"(‘sent’ ≠ ‘deployed’ — confirm by each board's downlink stage change.)")
             return True
         # ── 部分/全失敗:LOUD。冗餘可能已喪失,但單板仍安全(使用者確認:
-        #    冗餘設計,單傘/單氣囊仍可安全著陸)→ 提示補點,不是中止。 ──
+        #    雙板熱備援,任一板成功開傘即可安全著陸)→ 提示補點,不是中止。
+        #    ★2026-07-31:氣囊移除後這句話的份量更重了——傘是唯一的減速手段,
+        #    沒有第二層。所以「補點失敗的那塊板」現在是必做,不是選做。 ──
         self.logger.error(f"🔴🔴 [ALL] PARTIAL/FAILED broadcast: only {ok}/{len(chs)} boards accepted "
                           f"'{cmd}{args}'. FAILED: {failed}. HOT-STANDBY REDUNDANCY REDUCED (a single "
                           f"board still lands safely) — re-fire the failed board(s) individually to "
@@ -397,15 +399,18 @@ class MainWindow(QMainWindow):
             self.focus_buttons[ch] = b
 
         row.addWidget(self._vsep())
-        # 單板點火鈕(每板:傘=dpl、囊=abg;走該板 backend 單發)
+        # 單板點火鈕(每板:傘=dpl;走該板 backend 單發)
+        # ★2026-07-31:氣囊移除,「囊」鈕一併拿掉。
+        #   火箭端 PA0 已併入降落傘發火迴路(傘要 PA0+PA1 同時驅動),
+        #   單獨送 abg 只會半驅動傘迴路——點不著,卻讓操作員以為做了事。
+        #   在只剩一種火工品的情況下留著一顆會被拒收的紅鈕,是在緊急時
+        #   多給操作員一個按錯的選項。
         for ch in self.channel_ids:
             row.addWidget(self._make_pyro_button(f"傘 {ch}", ch, "dpl"))
-            row.addWidget(self._make_pyro_button(f"囊 {ch}", ch, "abg"))
 
         row.addWidget(self._vsep())
         # 廣播鈕(兩板同時;沿用 _all 的並行+LOUD 部分失敗告警)
         row.addWidget(self._make_pyro_button("傘 ALL", None, "dpl"))
-        row.addWidget(self._make_pyro_button("囊 ALL", None, "abg"))
 
         row.addWidget(self._vsep())
         # 校準鈕:火箭端氣壓零點重校(全板)+地面端姿態歸零一鍵完成。
@@ -667,14 +672,13 @@ class MainWindow(QMainWindow):
                     target=lambda: self.send_backend_command("send_remote_cmd", ["dpl"]),
                     daemon=True
                 ).start()
-            elif cmd == "/abg":
-                self.logger.warning("🚨 [EMERGENCY] Transmitting remote AIRBAG DEPLOYMENT command...")
-                self.broadcast_event("[CMD] ABG", "#1DE9B6")
-                self._register_confirm([self.focus_channel], "abg")
-                threading.Thread(
-                    target=lambda: self.send_backend_command("send_remote_cmd", ["abg"]),
-                    daemon=True
-                ).start()
+            elif cmd in ("/abg", "/abg_all"):
+                # ★2026-07-31:氣囊移除。指令保留成明確的錯誤訊息而不是刪掉,
+                # 是因為肌肉記憶——這兩道指令練了整個賽前,緊急時手指會自己打。
+                # 打了什麼都沒發生(Unknown command)比打了被告知去路更糟。
+                self.logger.error(
+                    "🚫 氣囊已於 2026-07-31 移除,/abg 與 /abg_all 不再有作用。"
+                    "PA0 現在是降落傘發火迴路的一半——要開傘請用 /dpl 或 /dpl_all。")
             # ── 雙板廣播:同時對所有航電板(ch1+ch2 熱備援)發命令 ──
             elif cmd == "/arm_all":
                 self.logger.warning("🚨 [SAFETY] Broadcasting SYSTEM ARM to ALL boards (30s Unlock Window)...")
@@ -689,13 +693,6 @@ class MainWindow(QMainWindow):
                 self._register_confirm(self.channel_ids, "dpl")
                 threading.Thread(
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["dpl"]),
-                    daemon=True
-                ).start()
-            elif cmd == "/abg_all":
-                self.logger.warning("🚨 [EMERGENCY] Broadcasting AIRBAG DEPLOY to ALL boards...")
-                self._register_confirm(self.channel_ids, "abg")
-                threading.Thread(
-                    target=lambda: self.send_backend_command_all("send_remote_cmd", ["abg"]),
                     daemon=True
                 ).start()
             elif cmd == "/cal":
@@ -741,10 +738,8 @@ class MainWindow(QMainWindow):
                     "  /reset-data       - Reset session data (archive old CSV/raw log, start new file & reset UI)\n"
                     "  /arm              - Remote Safety ARM (focus board, 30s window)\n"
                     "  /dpl              - Emergency Force Parachute Deploy (focus board)\n"
-                    "  /abg              - Emergency Deploy Airbag (focus board)\n"
                     "  /arm_all          - ARM ALL boards at once (ch1+ch2 hot-standby)\n"
                     "  /dpl_all          - Force Parachute Deploy on ALL boards at once\n"
-                    "  /abg_all          - Deploy Airbag on ALL boards at once\n"
                     "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
                     "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
                     "  /setch <0-80>     - Change rocket LoRa channel (850.125+ch MHz, IDLE only;\n"
@@ -758,7 +753,7 @@ class MainWindow(QMainWindow):
             else:
                 self.logger.error(f"Unknown terminal command: {cmd}")
         else:
-            self.logger.error(f"Unknown command: {text}. All commands must start with '/' (e.g. /arm, /dpl, /abg). Type /help for help.")
+            self.logger.error(f"Unknown command: {text}. All commands must start with '/' (e.g. /arm, /dpl, /cal). Type /help for help.")
 
     def reset_gui_state(self):
         """重置 GUI 相關狀態與 UI 視覺化元件 (清空圖表、地圖、階段列表與遙測統計)"""
@@ -1477,8 +1472,6 @@ class MainWindow(QMainWindow):
             self.ch_armed_until.pop(ch, None)
         elif "Parachute deployed successfully" in content:
             self._confirm_pyro(ch, "dpl", "MSG")
-        elif "Airbag inflation started" in content:
-            self._confirm_pyro(ch, "abg", "MSG")
         elif "REJECT" in content:
             # 指令被火箭閘門拒收:等待確認中的板要立刻知道,不必空等 10s。
             # ★必須比對「被拒的是哪一道指令」:舊版只比對頻道,結果一句
@@ -1492,6 +1485,10 @@ class MainWindow(QMainWindow):
                 return
             # 韌體的 pyro 拒收會自報 dpl/abg;非 pyro 指令(recal/setch/channel)
             # 一律不動 pending——它們跟火工品無關。
+            # "abg" 仍留在清單裡:韌體現在會回「REJECT abg - airbag removed」,
+            # 必須被辨識成【非開傘】的拒收。拿掉的話它會掉進下面的
+            # 「舊韌體未指明指令」fallback,把待確認的 dpl 一起清掉、
+            # 並在畫面上誤報成開傘被拒——正是本段註解在防的那件事。
             acts = [a for a in ("dpl", "abg") if a in low]
             if not acts:
                 if any(t in low for t in ("recal", "setch", "channel")):

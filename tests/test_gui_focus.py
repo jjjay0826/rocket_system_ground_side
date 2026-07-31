@@ -65,7 +65,10 @@ def run():
     btns = [w.pyro_flow.itemAt(i).widget() for i in range(w.pyro_flow.count())]
     pyro = [b for b in btns if isinstance(b, QPushButton) and not b.isCheckable()
             and (b.text().startswith("傘") or b.text().startswith("囊"))]
-    c.eq("找到 6 顆火工品按鈕", len(pyro), 6)
+    # ★2026-07-31 氣囊移除：原本 6 顆（傘/囊 × ch1/ch2/ALL），現在只剩傘 3 顆。
+    c.eq("找到 3 顆火工品按鈕（傘 ch1 / 傘 ch2 / 傘 ALL）", len(pyro), 3)
+    c.check("★不再有任何「囊」按鈕", not any(b.text().startswith("囊") for b in pyro),
+            "PA0 已併入傘迴路，單獨送 abg 只會半驅動——緊急時多一個按錯的選項")
     if pyro:
         b = pyro[0]
         w0 = b.width()
