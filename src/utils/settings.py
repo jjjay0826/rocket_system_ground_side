@@ -124,3 +124,30 @@ def save_settings(port: str, baudrate: int):
     相容性包裝：儲存 ch1 的設定。
     """
     save_channel_settings("ch1", port, baudrate)
+
+
+_VALID_AXIS_UP = ("+z", "+x", "+y", "-z", "-x", "-y")
+
+
+def load_axis_up():
+    """settings.json 的 "axis"：IMU 哪一支軸在火箭站直時朝上。
+
+    回傳 None = 沒設定 → 地面站會在發射台上自動偵測（見 _autodetect_axis）。
+    設了就是釘死，不再自動偵測 —— 現場如果已經量過、確定了，就不該讓
+    自動偵測有機會在某個晃動的瞬間改掉它。
+    """
+    if not os.path.exists(SETTINGS_FILE):
+        return None
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            v = json.load(f).get("axis")
+    except Exception as e:
+        logger.error(f"Error reading axis from {SETTINGS_FILE}: {e}")
+        return None
+    if v is None:
+        return None
+    if v in _VALID_AXIS_UP:
+        return v
+    logger.error(f"settings.json 的 axis=\"{v}\" 不合法，"
+                 f"必須是 {_VALID_AXIS_UP} 之一 —— 改用自動偵測。")
+    return None

@@ -27,6 +27,7 @@ SUITES = [
     ("reject",    "test_reject_dispatch.py",    False),
     ("link",      "test_link_battery.py",       False),
     ("sentinel",  "test_sentinel_poisoning.py", False),  # 2026-07-30 已修，見檔案開頭
+    ("axis",      "test_axis_mapping.py",       False),  # 2026-07-31 航電板改豎放
 ]
 
 

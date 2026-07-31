@@ -25,7 +25,7 @@ import zmq
 import time
 import json
 from src.core.models import SensorData
-from src.utils.settings import load_channel_settings, save_channel_settings
+from src.utils.settings import load_axis_up, load_channel_settings, save_channel_settings
 
 class MainWindow(QMainWindow):
     def __init__(self, channel_ids=None):
@@ -41,14 +41,36 @@ class MainWindow(QMainWindow):
         # ─── 快速軸向對應設定區 (Sensor Axis Mapping Configuration) ───
         # 定義：[火箭本體標準軸向] ➔ [感測器原始軸向] (支援正負號，例如 "-ay"、"+ax" 等)
         # 標準本體定義：Z_body=縱向自旋軸, X_body=橫向俯仰軸, Y_body=橫向偏航軸
-        self.axis_config = {
-            "ax": "+ax",  # 火箭 X 軸對應的感測器資料 (用以推算 Pitch)
-            "ay": "+ay",  # 火箭 Y 軸對應的感測器資料 (用以推算 Roll)
-            "az": "+az",  # 火箭 Z 軸對應的感測器資料 (用以對齊重力)
-            "gx": "+gx",  # 橫向俯仰角速度 (Pitch Rate)
-            "gy": "+gy",  # 橫向偏航角速度 (Yaw Rate)
-            "gz": "+gz"   # 縱向滾轉/自旋角速度 (Roll/Spin Rate)
+        #
+        # ★2026-07-31 航電板改成【豎放】。姿態算式（update_ui）寫死了
+        #   roll = atan2(ay, az)、pitch = atan2(-ax, hypot(ay,az))
+        #   —— 它假設【az 對齊重力】。板子一豎起來 az≈0，atan2 落在奇異點上：
+        #   火箭在發射台站得筆直，畫面卻顯示 ±90°，而 roll 會被 az 的雜訊
+        #   放大成亂跳。偏角(angle_deviation)是相對 calib_q 算的，受害較小，
+        #   但姿態視窗與 Pitch/Roll 曲線會完全不能看。
+        #
+        #   下面六組是「哪一支感測器軸朝上」各自對應的重映射。全部都是
+        #   【右手座標】—— 只把兩軸對調而不補負號會翻轉手性，陀螺儀的
+        #   旋轉方向會整個反過來，比不改還糟。六組的行列式都是 +1，
+        #   有回歸測試守著（tests/test_axis_mapping.py）。
+        self.AXIS_PRESETS = {
+            #        ax     ay     az     gx     gy     gz
+            "+z": ("+ax", "+ay", "+az", "+gx", "+gy", "+gz"),  # 平放（原本的假設）
+            "+x": ("+ay", "+az", "+ax", "+gy", "+gz", "+gx"),  # 循環
+            "+y": ("+az", "+ax", "+ay", "+gz", "+gx", "+gy"),  # 循環
+            "-z": ("+ay", "+ax", "-az", "+gy", "+gx", "-gz"),
+            "-x": ("+az", "+ay", "-ax", "+gz", "+gy", "-gx"),
+            "-y": ("+ax", "+az", "-ay", "+gx", "+gz", "-gy"),
         }
+        self._AXIS_KEYS = ("ax", "ay", "az", "gx", "gy", "gz")
+
+        # settings.json 的 "axis" 可以釘死（例如 "axis": "+x"），釘死就不自動偵測。
+        self.axis_up = load_axis_up()
+        self.axis_locked = self.axis_up is not None
+        if not self.axis_locked:
+            self.axis_up = "+z"          # 還沒偵測到之前沿用舊行為
+        self.axis_config = dict(zip(self._AXIS_KEYS, self.AXIS_PRESETS[self.axis_up]))
+        self._axis_votes = []            # 自動偵測用：連續一致才採信
         if channel_ids is None:
             channel_ids = ["ch1"]
         elif not isinstance(channel_ids, list):
@@ -695,6 +717,24 @@ class MainWindow(QMainWindow):
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["dpl"]),
                     daemon=True
                 ).start()
+            elif cmd == "/axis":
+                if len(parts) >= 2 and parts[1] in self.AXIS_PRESETS:
+                    up = parts[1]
+                    self.axis_config = dict(zip(self._AXIS_KEYS, self.AXIS_PRESETS[up]))
+                    self.axis_up, self.axis_locked = up, True
+                    self._axis_votes.clear()
+                    self.logger.warning(f"🧭 軸向手動設為 {up} → {self.axis_config}")
+                    self.broadcast_event(f"[🧭 軸向 {up}]", "#00B0FF")
+                elif len(parts) >= 2 and parts[1] == "auto":
+                    self.axis_locked = False
+                    self._axis_votes.clear()
+                    self.logger.warning("🧭 軸向改回自動偵測，請讓火箭靜置約 6 秒。")
+                else:
+                    self.logger.info(
+                        f"🧭 目前軸向：{self.axis_up}（{'鎖定' if self.axis_locked else '自動偵測中'}）"
+                        f" {self.axis_config}\n"
+                        f"   用法：/axis <+z|+x|+y|-z|-x|-y>  或  /axis auto\n"
+                        f"   意義：哪一支【感測器】軸在火箭站直時朝上")
             elif cmd == "/cal":
                 self._send_recal(broadcast=False)
             elif cmd == "/cal_all":
@@ -740,6 +780,7 @@ class MainWindow(QMainWindow):
                     "  /dpl              - Emergency Force Parachute Deploy (focus board)\n"
                     "  /arm_all          - ARM ALL boards at once (ch1+ch2 hot-standby)\n"
                     "  /dpl_all          - Force Parachute Deploy on ALL boards at once\n"
+                    "  /axis [dir|auto]  - Show/set IMU mounting axis (+z|+x|+y|-z|-x|-y); auto-detects on pad\n"
                     "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
                     "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
                     "  /setch <0-80>     - Change rocket LoRa channel (850.125+ch MHz, IDLE only;\n"
@@ -905,6 +946,57 @@ class MainWindow(QMainWindow):
 
         self.ui.listWidget.clear()
         
+    # ── 軸向自動偵測 ────────────────────────────────────────────────
+    # 火箭在發射台上會靜置好幾分鐘，重力就指在【縱軸】上。那段時間量一下
+    # 哪一支感測器軸吃到 1g，就知道板子是怎麼裝的了 —— 不必問人、不必記。
+    _AXIS_STILL_G   = 0.12   # |total_g − 1| 小於此值才算靜止
+    _AXIS_DOM_MIN   = 0.80   # 主軸至少要有這麼多 g
+    _AXIS_OTHER_MAX = 0.45   # 另外兩軸都要小於此值（否則是斜的，量不準）
+    _AXIS_VOTES     = 12     # 連續這麼多筆一致才採信（2Hz → 約 6 秒）
+
+    def _autodetect_axis(self, data):
+        """在 IDLE 靜置時判斷哪一支軸朝上。偵測到就套用並鎖定，只做一次。
+
+        刻意【只在 IDLE】做，而且一旦鎖定就不再改：飛行中重映射會讓
+        姿態曲線在半空中跳一下，那種圖沒有人看得懂，也無法事後分析。"""
+        if self.axis_locked:
+            return
+        if getattr(data, "stage", 0) != 0:
+            # 已經離架還沒偵測到 —— 放棄，維持現狀並講清楚
+            self.axis_locked = True
+            self.logger.warning(
+                f"⚠ 已離架但軸向尚未自動偵測到，沿用 {self.axis_up}。"
+                f"姿態顯示可能不正確，飛行資料不受影響。")
+            return
+        a = {k: getattr(data, k, 0.0) for k in ("ax", "ay", "az")}
+        total = math.sqrt(sum(v * v for v in a.values()))
+        if abs(total - 1.0) > self._AXIS_STILL_G:
+            self._axis_votes.clear()          # 有人在搬，重數
+            return
+        k_dom = max(a, key=lambda k: abs(a[k]))
+        if abs(a[k_dom]) < self._AXIS_DOM_MIN:
+            self._axis_votes.clear(); return
+        if any(abs(v) > self._AXIS_OTHER_MAX for k, v in a.items() if k != k_dom):
+            self._axis_votes.clear(); return
+
+        up = ("+" if a[k_dom] > 0 else "-") + k_dom[-1]
+        self._axis_votes.append(up)
+        if len(self._axis_votes) < self._AXIS_VOTES:
+            return
+        if len(set(self._axis_votes[-self._AXIS_VOTES:])) != 1:
+            self._axis_votes.clear(); return
+
+        self.axis_locked = True
+        if up == self.axis_up:
+            self.logger.info(f"🧭 軸向自動偵測：{up} 朝上，與目前設定相同，不變更。")
+            return
+        self.axis_config = dict(zip(self._AXIS_KEYS, self.AXIS_PRESETS[up]))
+        old, self.axis_up = self.axis_up, up
+        self.logger.warning(
+            f"🧭 軸向自動偵測：感測器 {up} 軸朝上（原設定 {old}）→ 已套用重映射 "
+            f"{self.axis_config}。要釘死請在 settings.json 加 \"axis\": \"{up}\"。")
+        self.broadcast_event(f"[🧭 軸向 {up}]", "#00B0FF")
+
     def _get_mapped_axis(self, data, key):
         """將 SensorData 的 raw 屬性依據 axis_config 對應轉換並套用正負號"""
         config_val = self.axis_config.get(key, f"+{key}")
@@ -1029,6 +1121,9 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.ui.map_label.setText('No Fix (No location data)')
+
+        # ★軸向自動偵測必須在讀取映射值【之前】跑，否則這一幀還是用舊映射
+        self._autodetect_axis(data)
 
         # 依軸向對應讀取並映射感測器數據，同時扣除靜止校準得到的陀螺儀零點偏置
         ax = self._get_mapped_axis(data, "ax")
