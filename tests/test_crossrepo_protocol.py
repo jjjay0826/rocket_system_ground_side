@@ -141,6 +141,30 @@ def run():
             and src.count("deploy_fire_on()") >= 6,
             f"deploy_fire_on() 出現 {src.count('deploy_fire_on()')} 次（應 ≥6）")
 
+    # ── ★上行指令 token 逐字比對 ────────────────────────────────────
+    # 韌體用 strcmp() 比對整串（main.c:795/815/841/917/918），差一個字元
+    # 指令就靜默失效 —— 火箭只回一句 "Unknown CMD"，在忙亂的發射台上
+    # 很容易被當成雜訊。而 /dpl 是緊急開傘的路徑。
+    #
+    # 這段以前【完全沒有測試覆蓋】：crossrepo 只驗下行的遙測格式，
+    # 上行的秘鑰字串兩邊各寫一份，改一邊不會有任何東西變紅。
+    # 去註解再抓：註解裡也寫了幾串 #CMD:（說明用），那些不算數
+    fw_tokens = set(re.findall(r'"(#CMD:[A-Z0-9_]+#)"', strip_c_comments(src)))
+    c.check("從 main.c 抓到上行指令 token", len(fw_tokens) >= 4,
+            f"抓到 {sorted(fw_tokens)}")
+    from src.core.lora_protocol import LoraCommand
+    for name in ("ARM", "DPL", "CAL", "GND", "GND_OFF", "ABG"):
+        tok = getattr(LoraCommand, name)[1].decode().strip()
+        # ABG 已於 2026-07-31 停用，但韌體仍要認得它才能明確拒收
+        c.check(f"★{name} token 與韌體逐字相同：{tok}", tok in fw_tokens,
+                f"韌體端有的是 {sorted(fw_tokens)}")
+    # 反向：韌體認得的每一條，地面站都要有辦法送
+    gs_tokens = {getattr(LoraCommand, n)[1].decode().strip()
+                 for n in ("ARM", "DPL", "CAL", "GND", "GND_OFF", "ABG")}
+    missing = fw_tokens - gs_tokens
+    c.check("韌體認得的指令地面站都送得出來", not missing,
+            f"地面站缺少：{sorted(missing)}" if missing else "")
+
     # 自動開傘的訊息**刻意不含** successfully，不該觸發下行確認
     auto = re.findall(r'"MSG SUCCESS Parachute deployed \([^"]*"', src)
     c.check("自動開傘訊息不含 'successfully'（不誤觸下行確認）",

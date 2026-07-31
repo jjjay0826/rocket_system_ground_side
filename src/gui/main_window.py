@@ -730,6 +730,26 @@ class MainWindow(QMainWindow):
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["dpl"]),
                     daemon=True
                 ).start()
+            elif cmd == "/gndtest":
+                if len(parts) >= 2 and parts[1].lower() in ("off", "0", "stop"):
+                    self.logger.warning("🧪 [GNDTEST] 送出【關閉】地面測試模式。")
+                    self.broadcast_event("[🧪 GNDTEST OFF]", "#7e8a9b")
+                    threading.Thread(
+                        target=lambda: self.send_backend_command(
+                            "send_remote_cmd", ["gndtest_off"]),
+                        daemon=True).start()
+                    return
+                # 規範 4.5.3 的地面測試入口。解除 PB6 手動發火的閘門，
+                # 10 分鐘後韌體自動恢復 —— 忘了關也不會帶上發射台。
+                # PB6 仍需 IDLE + ARM 才會動作，所以這一道本身不會點火。
+                self.logger.warning(
+                    "🧪 [GNDTEST] 送出地面測試模式（10 分鐘後自動失效）。"
+                    "PB6 手動發火在 IDLE + ARM 之下才會動作 —— "
+                    "⚠ 確認火工品已斷開再按 PB6。")
+                self.broadcast_event("[🧪 GNDTEST]", "#FFD600")
+                threading.Thread(
+                    target=lambda: self.send_backend_command("send_remote_cmd", ["gndtest"]),
+                    daemon=True).start()
             elif cmd == "/axis":
                 if len(parts) >= 2 and parts[1] in self.AXIS_PRESETS:
                     up = parts[1]
@@ -793,6 +813,7 @@ class MainWindow(QMainWindow):
                     "  /dpl              - Emergency Force Parachute Deploy (focus board)\n"
                     "  /arm_all          - ARM ALL boards at once (ch1+ch2 hot-standby)\n"
                     "  /dpl_all          - Force Parachute Deploy on ALL boards at once\n"
+                    "  /gndtest [off]    - Ground-test mode on focus board (unlocks PB6 manual fire, 10min auto-expiry)\n"
                     "  /axis [dir|auto]  - Show/set IMU mounting axis (+z|+x|+y|-z|-x|-y); auto-detects on pad\n"
                     "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
                     "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
