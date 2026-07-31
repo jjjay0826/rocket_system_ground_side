@@ -42,6 +42,9 @@ class SensorData:
     cond_b_raw: int = 0
     cond_b_eff: int = 0
     peak_height: float = 0.0
+    # pyro 電源監測(火箭端 PB1/PB0 ADC)。-1 = 該板無量測能力(舊韌體或 ADC 掛)
+    v_fuse: float = -1.0   # 保險絲後端電壓:0V=熔斷(誤觸發已被 shunt 擋下)
+    v_arm: float = -1.0    # arming 開關後端電壓:>0=已武裝(規範 4.6.7 遠端驗證)
     sd_writes: int = 0
     lora_seq: int = 0
     lora_success: int = 0
@@ -86,7 +89,7 @@ class SensorData:
                 "flight_state", "module_state", "gnss_state", "sv_visible", "sv_used",
                 "buffer_val", "count_val", "cond_a_raw", "cond_a_eff", "cond_b_raw",
                 "cond_b_eff", "peak_height", "sd_writes", "lora_seq", "lora_success",
-                "lora_total", "gs_timestamp"
+                "lora_total", "gs_timestamp", "v_fuse", "v_arm"
             ]
             for field in optional_fields:
                 if field in data:
@@ -140,6 +143,9 @@ class SensorData:
             'PK': r'\bPK([+-]?\d*\.?\d+)\b',
             'SD': r'\bSD(\d+)\b',
             'LR': r'\bLR:(\d+),(\d+),(\d+)\b',
+            'SQ': r'\bSQ(\d+)\b',
+            'VF': r'\bVF([+-]?\d*\.?\d+)\b',
+            'VA': r'\bVA([+-]?\d*\.?\d+)\b',
             'LAT': r'\bLAT([+-]?\d*\.?\d+)\b',
             'LON': r'\bLON([+-]?\d*\.?\d+)\b',
         }
@@ -157,6 +163,19 @@ class SensorData:
 
         if extracted['T'] is None:
             raise ValueError("Not in telemetry format: missing 'T' field")
+
+        # ★截斷偵測:舊版只檢查 T,其餘欄位缺了就靜默填 0 —— RF 干擾切掉封包
+        # 尾巴時,'T12345 AX+0.01' 會被當成一筆完整資料接受,產生高度 0、
+        # 速度 0、**ST 0** 的假紀錄寫進 CSV。
+        # 其中 ST 最危險:假的 stage=0 會重設地面站的 stage 邊緣偵測基準,
+        # 下一筆真封包的 stage=2 就成了「0→2 的轉入」→ 在沒有新證據的情況下
+        # 確認開傘指令(正是下行確認機制要防的假陽性)。
+        # ST/MOD/GA 位於封包後段,任一缺席即代表尾巴被切掉 → 整筆丟棄。
+        _required = [k for k in ('ST', 'MOD', 'GA') if extracted[k] is None]
+        if _required:
+            raise ValueError(
+                f"Truncated telemetry frame: missing {','.join(_required)} "
+                f"(len={len(line)})")
 
         t_val = int(extracted['T'])
         ax = float(extracted['AX']) if extracted['AX'] else 0.0
@@ -274,7 +293,23 @@ class SensorData:
             
         direction = 0.0
 
+        # 發送序號:火箭每發一包遞增 1,地面端用跳號量化掉包率。
+        # 只在 SQ 欄位存在時覆寫——舊格式的 LR:seq,ok,total(上面第一段)仍有效,
+        # 沒有 SQ 就不能把它歸零。0 = 兩種格式都沒帶,不參與掉包計算。
+        if extracted['SQ'] is not None:
+            lora_seq = int(extracted['SQ'])
+
+        # pyro 電源監測(缺欄位=舊韌體 → -1 表示「無此能力」,不可與 0V 熔斷混淆)
+        v_fuse = float(extracted['VF']) if extracted['VF'] is not None else -1.0
+        v_arm  = float(extracted['VA']) if extracted['VA'] is not None else -1.0
+
         # GPS 經緯度解析
+        # ★GPS 宣稱已定位、座標卻缺席 = 封包在 LAT/LON 之前就被切掉。
+        # 舊碼會靜默套用 (25.0, 121.5) —— 台北。那個座標會被當成「有效定位」
+        # 畫在地圖上、寫進 CSV,落海搜救時是災難性的誤導。
+        # 這種情況降級為 NO_FIX,讓地面站照「沒有定位」處理。
+        if gnss_state == "FIX_3D" and (extracted['LAT'] is None or extracted['LON'] is None):
+            gnss_state = "NO_FIX"
         lat = float(extracted['LAT']) if extracted['LAT'] else 25.0
         lon = float(extracted['LON']) if extracted['LON'] else 121.5
         location = (lat, lon)
@@ -309,6 +344,8 @@ class SensorData:
             cond_b_raw=cb_raw,
             cond_b_eff=cb_eff,
             peak_height=pk_val,
+            v_fuse=v_fuse,
+            v_arm=v_arm,
             sd_writes=sd_val,
             lora_seq=lora_seq,
             lora_success=lora_success,
@@ -353,7 +390,9 @@ class SensorData:
             "sd_writes": self.sd_writes,
             "lora_seq": self.lora_seq,
             "lora_success": self.lora_success,
-            "lora_total": self.lora_total
+            "lora_total": self.lora_total,
+            "v_fuse": self.v_fuse,
+            "v_arm": self.v_arm
         }
 @dataclass
 class LogData:

@@ -9,3 +9,8 @@ app.log
 logs/
 data/
 backend_*.log
+
+# 機器專屬設定：COM port 每台電腦不同，入庫會在合併時互相覆蓋。
+# 缺檔時 src/utils/settings.py 的 DEFAULT_CHANNELS 會接手，
+# 用 GUI 的 /port 指令改一次就會自動寫回本檔。範本見 settings.example.json。
+settings.json

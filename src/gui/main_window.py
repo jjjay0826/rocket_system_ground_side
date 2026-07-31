@@ -4,14 +4,17 @@ import threading
 import math
 import socket
 import re
+from collections import deque
 from datetime import datetime
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QCheckBox, QLabel, QPushButton
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QCheckBox,
+                             QLabel, QPushButton, QWidget)
 from PyQt6.QtQuick import QQuickWindow, QSGRendererInterface
 from PyQt6.QtCore import QTimer
 
 from src.gui.ui_main import Ui_MainWindow  
 from src.gui.qt_observer import QtGuiObserver
 from src.gui.visualizers.line_chart import LineChartDrawer
+from src.gui.flow_layout import FlowLayout
 from src.gui.visualizers.stage_display import StageDisplayer
 import logging
 from src.gui.visualizers.log_displayer import LogDisplayer
@@ -32,6 +35,7 @@ class MainWindow(QMainWindow):
         self.max_total_accel = 0.0
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
+        self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self.calib_q = None
         
         # ─── 快速軸向對應設定區 (Sensor Axis Mapping Configuration) ───
@@ -67,6 +71,22 @@ class MainWindow(QMainWindow):
         self.start_time = time.time()
         self.last_recv_time = {ch: None for ch in self.channel_ids}
         self.channel_status = {ch: "No Data" for ch in self.channel_ids}
+
+        # ── 下行閉環狀態(R1/R4)+格式錯誤偵測+VID/PID 快取 ──
+        self.ch_last_fmt_err = {}     # ch -> 最近一次「解析失敗」時間戳(格式錯黃燈)
+        self.ch_armed_until = {}      # ch -> ARMED 視窗截止時間(火箭 MSG 回讀)
+        self.pending_confirms = {}    # (ch, action) -> 確認期限;逾期=LOUD 告警
+        self.ch_pyro_confirmed = {}   # (ch, action) -> 火箭下行確認時間戳
+        self._ports_cache = {}        # COM -> list_ports 資訊(VID/PID 識別)
+        self._ports_scan_ts = 0.0
+        self.ch_view_state = {}       # ch -> 該頻道的姿態/統計快照(切焦點時交換)
+        self.ch_pyro_volt = {}        # ch -> (v_fuse, v_arm, 時間戳):pyro 電源監測
+        self._prev_pyro_flags = {}    # ch -> (熔斷?, 已武裝?):只在狀態翻轉時發告警
+        self.ch_prev_stage = {}       # ch -> 上一筆 stage(偵測「轉入」開傘的邊緣)
+        self.ch_seq = {}              # ch -> 最近收到的序號(deque):量化掉包率
+        self.ch_link = {}             # ch -> (到達率 0~1, 樣本數)
+        self._prev_batt_level = {}
+        self._prev_drift_level = {}   # ch -> 氣壓基準漂移等級,只在惡化時告警    # ch -> "ok"/"low"/"crit":只在惡化時警告
 
         self.latest_data = None
 
@@ -287,9 +307,36 @@ class MainWindow(QMainWindow):
 
     # ══════════════════ 焦點切換與火工品按鈕列(F2) ══════════════════
 
+    # 焦點頻道專屬狀態:切換時整包存起來、換上另一頻道的那包。
+    # (姿態濾波/統計極值/校準基準本質上是「每塊板一套」,共用會互相污染)
+    _PER_CH_STATE = ("latest_data", "last_valid_location", "last_valid_location_time",
+                     "est_pitch", "est_roll", "est_yaw", "angle_deviation",
+                     "max_total_accel", "max_deviation_angle", "max_height",
+                     "calib_q", "quaternion", "gyro_bias_x", "gyro_bias_y",
+                     "gyro_bias_z", "gyro_history", "prev_health")
+
+    def _snapshot_focus_state(self) -> dict:
+        return {k: getattr(self, k, None) for k in self._PER_CH_STATE}
+
+    def _blank_focus_state(self) -> dict:
+        """某頻道第一次成為焦點時的乾淨初值(欄位須與 _PER_CH_STATE 對齊)。"""
+        return dict(latest_data=None, last_valid_location=None,
+                    last_valid_location_time=None,
+                    est_pitch=0.0, est_roll=0.0, est_yaw=180.0, angle_deviation=0.0,
+                    max_total_accel=0.0, max_deviation_angle=0.0, max_height=0.0,
+                    calib_q=None, quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+                    gyro_bias_x=0.0, gyro_bias_y=0.0, gyro_bias_z=0.0,
+                    gyro_history=[], prev_health={})
+
+    def _apply_focus_state(self, snap: dict):
+        for k, v in snap.items():
+            setattr(self, k, v)
+
     def set_focus_channel(self, ch: str):
-        """切換 GUI 渲染焦點頻道。切換=清空單通道視圖重畫(latest_data/
-        姿態濾波/圖表/stage 全是單套狀態,凍結混用會出鬼影)。"""
+        """切換 GUI 渲染焦點頻道 = 換視角,不是重來。
+        ★舊版切換直接 reset_gui_state(),圖表/統計/地圖全毀——來回切一次
+          資料就沒了。現在改成:每頻道的姿態濾波與極值統計各自存一份,
+          切換時整包交換;圖表歷史保留(切換點畫一條標記線標示分界)。"""
         if ch not in self.channel_ids:
             return
         # 按鈕視覺同步「先於」same-channel early return:checkable 按鈕被
@@ -300,15 +347,38 @@ class MainWindow(QMainWindow):
         if ch == self.focus_channel:
             return
         old = self.focus_channel
+        self.ch_view_state[old] = self._snapshot_focus_state()      # 存舊的
         self.focus_channel = ch
-        self.logger.info(f"🔀 Focus channel switched: {old} -> {ch} (charts/map/stage reset)")
-        self.reset_gui_state()
+        self._apply_focus_state(self.ch_view_state.get(ch) or self._blank_focus_state())
+        self.logger.info(f"🔀 Focus channel switched: {old} -> {ch} "
+                         f"(圖表歷史保留;{ch} 的統計已還原)")
+
+        # 圖表上標一條分界線,免得操作員把兩頻道的曲線段誤讀成同一塊板
+        x = time.time() - self.start_time
+        for c in (self.chart_1, self.chart_2, self.chart_3):
+            try:
+                c.add_event_marker(x, f"▼{ch}", "#3D7BD9")
+            except Exception:
+                pass
+
+        # 立刻用新頻道的狀態刷新姿態與極值顯示(否則要等下一筆遙測才更新)
+        self.attitude_displayer.update(self.quaternion)
+        self.ui.gl_label.setText(
+            f"當前偏角: {self.angle_deviation:.1f}° | 最大偏角: {self.max_deviation_angle:.1f}°")
 
     def _build_pyro_button_row(self):
         """建構 log 與命令列之間的操作列(容器 pyro_button_row 由 .ui 提供):
-        [焦點: ch1 ch2] ┃ [傘/囊 x 各板] ┃ [傘ALL 囊ALL] ┃ [Auto跟隨]
-        點火鈕=兩段式防誤觸:第一按變紅倒數 3 秒,再按才發射,逾時還原。"""
-        row = self.ui.pyro_button_row
+        [焦點: ch1 ch2] ┃ [傘/囊 x 各板] ┃ [傘ALL 囊ALL] ┃ [校準] [Auto跟隨]
+        點火鈕=兩段式防誤觸:第一按變紅倒數 3 秒,再按才發射,逾時還原。
+
+        ★用 FlowLayout 而非 .ui 給的 QHBoxLayout:整排約 950px,寬螢幕一列排得
+          下,但小筆電會溢出把右側圖表擠掉。FlowLayout 在寬度不足時自動折成
+          兩列,不必為不同螢幕維護兩套版面。"""
+        outer = self.ui.pyro_button_row      # .ui 提供的 QHBoxLayout
+        holder = QWidget()
+        row = FlowLayout(holder, margin=0, spacing=6)
+        outer.addWidget(holder)
+        self.pyro_flow = row                 # 測試/後續存取用
 
         lbl = QLabel("焦點:")
         lbl.setStyleSheet("color: #888888;")
@@ -337,7 +407,19 @@ class MainWindow(QMainWindow):
         row.addWidget(self._make_pyro_button("傘 ALL", None, "dpl"))
         row.addWidget(self._make_pyro_button("囊 ALL", None, "abg"))
 
-        row.addStretch(1)
+        row.addWidget(self._vsep())
+        # 校準鈕:火箭端氣壓零點重校(全板)+地面端姿態歸零一鍵完成。
+        # 韌體 IDLE 閘門擋掉飛行中誤按,故單擊即發、不套兩段式紅色確認。
+        cal_btn = QPushButton("校準 ALL")
+        cal_btn.setFixedHeight(26)
+        cal_btn.setStyleSheet(
+            "QPushButton{background:#1B3A4B;color:#7FD4E8;border:1px solid #2E5F73;"
+            "border-radius:4px;padding:2px 10px;}"
+            "QPushButton:hover{background:#25506A;}")
+        cal_btn.clicked.connect(lambda: self._send_recal(broadcast=True))
+        row.addWidget(cal_btn)
+
+        # (FlowLayout 靠左排並自動折行,不需要 addStretch 撐開)
 
         # ── F5:全域「Auto 跟隨」——代理 4 顆原生 Auto(3 chart + map)──
         # 原 checkbox 隱藏但保留(update_ui 照舊讀它們,零改繪圖邏輯);
@@ -380,6 +462,20 @@ class MainWindow(QMainWindow):
         armed_style = ("QPushButton{background:#CC2222;color:white;border:2px solid #FF5555;"
                        "border-radius:4px;padding:2px 10px;font-weight:bold;}")
         btn.setStyleSheet(idle_style)
+        # ★寬度預先鎖死,兩種文字取較寬者:否則第一按文字變長→按鈕撐大→整排
+        #   左右位移,第二按時手指落點已不是同一顆鈕(誤點鄰鈕)。
+        #   確認態刻意用極短的「確認?」——早期版本寫「確認 傘 ch1?」,鎖出來的
+        #   寬度是原本兩倍,六顆鈕就把整條操作列撐爆、擠掉右側圖表。
+        #   按鈕位置不動 + 轉紅 + 粗體,已足夠辨識是哪一顆在等確認。
+        _fm = btn.fontMetrics()
+        btn.setFixedWidth(max(_fm.horizontalAdvance(label),
+                              _fm.horizontalAdvance("確認?")) + 20)
+        btn.setToolTip(
+            f"{label} —— 兩段式防誤觸:\n"
+            f"① 第一次按 → 變紅並顯示「確認 {label}?」,開始 3 秒倒數\n"
+            f"② 3 秒內再按一次 → 才真正發射\n"
+            f"• 300ms 內的連按視為手抖/雙擊,直接忽略\n"
+            f"• 3 秒沒有第二次按 → 自動解除,回到安全狀態")
         state = {"armed": False, "armed_at": 0.0}
         timer = QTimer(self)
         timer.setSingleShot(True)
@@ -392,6 +488,7 @@ class MainWindow(QMainWindow):
         def _fire():
             target = "ALL" if ch is None else ch
             self.logger.warning(f"🚨 [PYRO BUTTON] {action.upper()} -> {target}")
+            self._register_confirm(self.channel_ids if ch is None else [ch], action)
             if ch is None:
                 threading.Thread(
                     target=lambda: self.send_backend_command_all("send_remote_cmd", [action]),
@@ -414,13 +511,84 @@ class MainWindow(QMainWindow):
             else:
                 state["armed"] = True
                 state["armed_at"] = time.monotonic()
-                btn.setText(f"確認 {label}?")
+                btn.setText("確認?")
                 btn.setStyleSheet(armed_style)
                 timer.start(3000)   # 3 秒未確認自動還原
 
         timer.timeout.connect(_disarm)
         btn.clicked.connect(_on_click)
         return btn
+
+    def _send_recal(self, broadcast: bool = True):
+        """發火箭端氣壓零點重校(#CMD:RECAL)並連帶做地面端姿態歸零——
+        火箭與地面的零點一鍵對齊。韌體只在 IDLE 受理,飛行中誤發會被拒收
+        (回 MSG WARN),無安全風險,故不走兩段式確認。"""
+        scope = "ALL boards" if broadcast else "focus board"
+        self.logger.info(f"🧭 [CAL] Transmitting baro re-zero (RECAL) to {scope}...")
+        self.broadcast_event("[CMD] CAL", "#00E5FF")
+        if broadcast:
+            threading.Thread(
+                target=lambda: self.send_backend_command_all("send_remote_cmd", ["cal"]),
+                daemon=True).start()
+        else:
+            threading.Thread(
+                target=lambda: self.send_backend_command("send_remote_cmd", ["cal"]),
+                daemon=True).start()
+        self._reset_angle_ground()
+
+    def _reset_angle_ground(self):
+        """地面端姿態/零偏歸零(原 /reset-angle 內聯邏輯抽出,供指令與 CAL 鈕共用)。"""
+        if not self.latest_data:
+            self.logger.error('No data received yet, cannot reset angle')
+            return
+        self.angle_deviation = self.latest_data.direction
+
+        # 1. 依據映射後的加速度讀值推算出當前對地角度作為濾波器初始值 (自動校準)
+        ax = self._get_mapped_axis(self.latest_data, "ax")
+        ay = self._get_mapped_axis(self.latest_data, "ay")
+        az = self._get_mapped_axis(self.latest_data, "az")
+        try:
+            roll_rad = math.atan2(ay, az)
+            pitch_rad = math.atan2(-ax, math.sqrt(ay**2 + az**2))
+            self.est_pitch = roll_rad * 180.0 / math.pi
+            self.est_roll = -pitch_rad * 180.0 / math.pi
+        except Exception:
+            self.est_pitch = 0.0
+            self.est_roll = 0.0
+
+        # 垂直於地面的旋轉角度 (Yaw) 則重置回到正前方 (180.0)
+        self.est_yaw = 180.0
+
+        # 2. 計算映射後的角速度均值作為靜態陀螺儀零點偏置 (Gyro Bias Calibration)
+        if self.gyro_history:
+            mapped_gyros = []
+            for h_data in self.gyro_history:
+                mgx = self._get_mapped_axis(h_data, "gx")
+                mgy = self._get_mapped_axis(h_data, "gy")
+                mgz = self._get_mapped_axis(h_data, "gz")
+                mapped_gyros.append((mgx, mgy, mgz))
+
+            self.gyro_bias_x = sum(g[0] for g in mapped_gyros) / len(mapped_gyros)
+            self.gyro_bias_y = sum(g[1] for g in mapped_gyros) / len(mapped_gyros)
+            self.gyro_bias_z = sum(g[2] for g in mapped_gyros) / len(mapped_gyros)
+        else:
+            self.gyro_bias_x = self._get_mapped_axis(self.latest_data, "gx")
+            self.gyro_bias_y = self._get_mapped_axis(self.latest_data, "gy")
+            self.gyro_bias_z = self._get_mapped_axis(self.latest_data, "gz")
+
+        self.calib_q = self.handle_angle_change(self.est_pitch, self.est_yaw, self.est_roll)
+        self.max_deviation_angle = 0.0
+        self.max_total_accel = 0.0
+        self.max_height = 0.0
+        self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
+        self.ui.gl_label.setText(
+            "當前偏角: 0.0° | 最大偏角: 0.0°"
+        )
+        self.broadcast_event("[CMD] Reset Angle", "#00E5FF")
+        self.logger.info(
+            f"Angles calibrated: Yaw reset to 180.0, Pitch gravity={self.est_pitch:.2f}, Roll gravity={self.est_roll:.2f}. "
+            f"Gyro Bias calibrated - X:{self.gyro_bias_x:.4f}, Y:{self.gyro_bias_y:.4f}, Z:{self.gyro_bias_z:.4f}"
+        )
 
     def on_enter_pressed(self):
         text = self.ui.lineEdit.text().strip()
@@ -487,56 +655,7 @@ class MainWindow(QMainWindow):
                 status_str = "ENABLED" if new_state else "DISABLED"
                 self.logger.info(f"Hiding port retry logs is now {status_str}")
             elif cmd == "/reset-angle":
-                if self.latest_data:
-                    self.angle_deviation = self.latest_data.direction
-                    
-                    # 1. 依據映射後的加速度讀值推算出當前對地角度作為濾波器初始值 (自動校準)
-                    ax = self._get_mapped_axis(self.latest_data, "ax")
-                    ay = self._get_mapped_axis(self.latest_data, "ay")
-                    az = self._get_mapped_axis(self.latest_data, "az")
-                    try:
-                        roll_rad = math.atan2(ay, az)
-                        pitch_rad = math.atan2(-ax, math.sqrt(ay**2 + az**2))
-                        self.est_pitch = roll_rad * 180.0 / math.pi
-                        self.est_roll = -pitch_rad * 180.0 / math.pi
-                    except Exception:
-                        self.est_pitch = 0.0
-                        self.est_roll = 0.0
-                    
-                    # 垂直於地面的旋轉角度 (Yaw) 則重置回到正前方 (180.0)
-                    self.est_yaw = 180.0
-                    
-                    # 2. 計算映射後的角速度均值作為靜態陀螺儀零點偏置 (Gyro Bias Calibration)
-                    if self.gyro_history:
-                        mapped_gyros = []
-                        for h_data in self.gyro_history:
-                            mgx = self._get_mapped_axis(h_data, "gx")
-                            mgy = self._get_mapped_axis(h_data, "gy")
-                            mgz = self._get_mapped_axis(h_data, "gz")
-                            mapped_gyros.append((mgx, mgy, mgz))
-                        
-                        self.gyro_bias_x = sum(g[0] for g in mapped_gyros) / len(mapped_gyros)
-                        self.gyro_bias_y = sum(g[1] for g in mapped_gyros) / len(mapped_gyros)
-                        self.gyro_bias_z = sum(g[2] for g in mapped_gyros) / len(mapped_gyros)
-                    else:
-                        self.gyro_bias_x = self._get_mapped_axis(self.latest_data, "gx")
-                        self.gyro_bias_y = self._get_mapped_axis(self.latest_data, "gy")
-                        self.gyro_bias_z = self._get_mapped_axis(self.latest_data, "gz")
-                    
-                    self.calib_q = self.handle_angle_change(self.est_pitch, self.est_yaw, self.est_roll)
-                    self.max_deviation_angle = 0.0
-                    self.max_total_accel = 0.0
-                    self.max_height = 0.0
-                    self.ui.gl_label.setText(
-                        "當前偏角: 0.0° | 最大偏角: 0.0°"
-                    )
-                    self.broadcast_event("[CMD] Reset Angle", "#00E5FF")
-                    self.logger.info(
-                        f"Angles calibrated: Yaw reset to 180.0, Pitch gravity={self.est_pitch:.2f}, Roll gravity={self.est_roll:.2f}. "
-                        f"Gyro Bias calibrated - X:{self.gyro_bias_x:.4f}, Y:{self.gyro_bias_y:.4f}, Z:{self.gyro_bias_z:.4f}"
-                    )
-                else:
-                    self.logger.error('No data received yet, cannot reset angle')
+                self._reset_angle_ground()
             elif cmd in ["/reset-data", "/reset"]:
                 self.logger.info("Requesting backend to archive session data and create new log files...")
 
@@ -558,8 +677,11 @@ class MainWindow(QMainWindow):
                     daemon=True
                 ).start()
             elif cmd == "/dpl":
+                if self._ascent_guard([self.focus_channel], "dpl"):
+                    return
                 self.logger.warning("🚨 [EMERGENCY] Transmitting remote FORCE PARACHUTE DEPLOYMENT command...")
                 self.broadcast_event("[CMD] DPL", "#D500F9")
+                self._register_confirm([self.focus_channel], "dpl")
                 threading.Thread(
                     target=lambda: self.send_backend_command("send_remote_cmd", ["dpl"]),
                     daemon=True
@@ -567,6 +689,7 @@ class MainWindow(QMainWindow):
             elif cmd == "/abg":
                 self.logger.warning("🚨 [EMERGENCY] Transmitting remote AIRBAG DEPLOYMENT command...")
                 self.broadcast_event("[CMD] ABG", "#1DE9B6")
+                self._register_confirm([self.focus_channel], "abg")
                 threading.Thread(
                     target=lambda: self.send_backend_command("send_remote_cmd", ["abg"]),
                     daemon=True
@@ -579,17 +702,48 @@ class MainWindow(QMainWindow):
                     daemon=True
                 ).start()
             elif cmd == "/dpl_all":
+                if self._ascent_guard(self.channel_ids, "dpl"):
+                    return
                 self.logger.warning("🚨 [EMERGENCY] Broadcasting FORCE PARACHUTE DEPLOY to ALL boards...")
+                self._register_confirm(self.channel_ids, "dpl")
                 threading.Thread(
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["dpl"]),
                     daemon=True
                 ).start()
             elif cmd == "/abg_all":
                 self.logger.warning("🚨 [EMERGENCY] Broadcasting AIRBAG DEPLOY to ALL boards...")
+                self._register_confirm(self.channel_ids, "abg")
                 threading.Thread(
                     target=lambda: self.send_backend_command_all("send_remote_cmd", ["abg"]),
                     daemon=True
                 ).start()
+            elif cmd == "/cal":
+                self._send_recal(broadcast=False)
+            elif cmd == "/cal_all":
+                self._send_recal(broadcast=True)
+            elif cmd == "/setch":
+                # 換 LoRa 頻道。⚠ 火箭換完後,地面 dongle 也必須跟著換,
+                # 否則該板立刻失聯——所以這裡只送指令並大聲提醒,不自動改本地。
+                if len(parts) < 2 or not parts[1].isdigit() or not (0 <= int(parts[1]) <= 80):
+                    self.logger.error("Usage: /setch <0-80>   例:/setch 72 → 922.125 MHz")
+                else:
+                    ch = int(parts[1])
+                    freq = 850.125 + ch
+                    # 合規提示(不阻擋):NCC LP0002 只准 920-925MHz = CH70~74
+                    if not (70 <= ch <= 74):
+                        self.logger.error(
+                            f"⚠ [SETCH] CH{ch} = {freq:.3f} MHz 落在 920-925 MHz 合規頻段外!"
+                            f"台灣 LP0002 只准 CH70~74(920.125~924.125 MHz)。"
+                            f"指令仍會送出——請確認這是你要的。")
+                    self.logger.warning(
+                        f"📻 [SETCH] 要求焦點板 {self.focus_channel} 換到 CH{ch} ({freq:.3f} MHz)。"
+                        f"⚠ 火箭換頻後,地面 dongle 必須也設成 CH{ch},否則此板立即失聯。"
+                        f"僅 IDLE 受理;飛行中火箭會拒收。")
+                    self.broadcast_event(f"[CMD] SETCH {ch}", "#00B0FF")
+                    threading.Thread(
+                        target=lambda: self.send_backend_command(
+                            "send_remote_cmd", [f"setch_{ch}"]),
+                        daemon=True).start()
             elif cmd == "/focus":
                 if len(parts) >= 2 and parts[1] in self.channel_ids:
                     self.set_focus_channel(parts[1])
@@ -610,7 +764,14 @@ class MainWindow(QMainWindow):
                     "  /arm_all          - ARM ALL boards at once (ch1+ch2 hot-standby)\n"
                     "  /dpl_all          - Force Parachute Deploy on ALL boards at once\n"
                     "  /abg_all          - Deploy Airbag on ALL boards at once\n"
-                    "  /focus <ch>       - Switch GUI focus channel (charts/map/stage re-render)"
+                    "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
+                    "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
+                    "  /setch <0-80>     - Change rocket LoRa channel (850.125+ch MHz, IDLE only;\n"
+                    "                      ground dongle MUST be changed to match or board is lost)\n"
+                    "  /focus <ch>       - Switch GUI focus channel (charts/map/stage re-render)\n"
+                    "Status extras: 黃燈=Format Error(資料流入但解析全失敗);"
+                    "簡版狀態列 🔓ARMxx s=該板火箭回讀的解鎖倒數;"
+                    "pyro 指令 10s 未見下行確認(MSG/stage)會 LOUD 告警"
                 )
                 self.logger.info(help_msg)
             else:
@@ -632,6 +793,7 @@ class MainWindow(QMainWindow):
         self.max_total_accel = 0.0
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
+        self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self.calib_q = None
         self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])
         
@@ -642,6 +804,18 @@ class MainWindow(QMainWindow):
         
         self.prev_health = {}
         self.ch_latest_alt = {}   # 非焦點高度快取一併清(活頻道 0.5s 內自動回填)
+        self.ch_last_fmt_err = {}
+        self.ch_armed_until = {}
+        self.pending_confirms = {}
+        self.ch_pyro_confirmed = {}
+        self.ch_view_state = {}   # 各頻道保存的統計/姿態一併清(這是真正的「重來」)
+        self.ch_pyro_volt = {}
+        self._prev_pyro_flags = {}
+        self.ch_prev_stage = {}
+        self.ch_seq = {}
+        self.ch_link = {}
+        self._prev_batt_level = {}
+        self._prev_drift_level = {}
         # F3-A 覆疊曲線一併清:start_time 已重置,舊 x 基準的點續留會錯位
         for ov in getattr(self, "alt_overlays", {}).values():
             ov["kh"].reset()
@@ -699,7 +873,7 @@ class MainWindow(QMainWindow):
         cfg = self.channel_configs.get(self.focus_channel, {})
         port = cfg.get("port", "N/A")
         baud = cfg.get("baud", "N/A")
-        self.ui.serial_label.setText(f'port︰{port}｜baudrate︰{baud}｜Status︰Connecting')
+        self._refresh_detail_label(self.focus_channel, baud)
         # 更新圖表標題
         self.ui.chart_label_1.setText("高度與速度")
         self.ui.chart_label_2.setText("加速度")
@@ -1002,6 +1176,25 @@ class MainWindow(QMainWindow):
         is_new_event, ev_name, ev_color = self.stage_display.update(data.stage, data.timestamp)
         if is_new_event:
             self.broadcast_event(f"[{ev_name}]", ev_color)
+
+        # ── 地面站自行推導的事件（火箭端的 5 個狀態刻意不含這些）──────────
+        # 資料本來就在遙測裡，推導出來標成「地面推導」與火箭回報視覺上分開。
+        # 火箭端不加狀態的理由：那 5 個是開傘決策實際在用的，多一個就要
+        # 重新稽核所有 flight_state 比較，賽前不值得動。
+        if data.stage == 1:
+            # BURNOUT：合加速度跌回 1.15g 以下 = 進入慣性滑行（與韌體同一門檻）
+            if (not math.isnan(getattr(data, "total_accel", float("nan")))
+                    and data.total_accel < 1.15
+                    and getattr(self, "_seen_boost", False)):
+                if self.stage_display.mark_derived("BURNOUT", data.timestamp, "#FF9100"):
+                    self.broadcast_event("[BURNOUT]", "#FF9100")
+            if getattr(data, "total_accel", 0.0) > 1.5:
+                self._seen_boost = True
+        elif data.stage == 2:
+            # APOGEE：進入開傘的那一刻，峰值已經確定
+            if self.stage_display.mark_derived(
+                    f"APOGEE {self.max_height:.0f}m", data.timestamp, "#FFD600"):
+                self.broadcast_event(f"[APOGEE {self.max_height:.0f}m]", "#FFD600")
         # Update health status labels based on failedTasks (0:BMP, 1:IMU, 2:LoRa, 3:SD)
         health_map = [
             (self.ui.health_bmp, "BMP"),
@@ -1036,6 +1229,26 @@ class MainWindow(QMainWindow):
 
         if prev_status in ["No Data", "Lost", "Stale", "Backend Offline"]:
             self.logger.info(f"Telemetry channel '{topic}' connection established/resumed.")
+
+        # R1 第二證據源:stage「轉入」DEPLOYING(2)/DEPLOYED(3) 的那一刻。
+        # ★必須是邊緣(轉入)而非位準(現在是 2/3):stage 一旦轉開傘就整趟飛行
+        #   維持不變,用位準判斷會讓「之後」送出的任何開傘指令在 0.5s 內被
+        #   這個舊狀態判定為成功——上行完全死掉也照樣顯示 ✅,確認機制在最
+        #   需要它誠實的時候失效。
+        # ★prev_stage is None(該頻道第一筆)不觸發:GUI 中途啟動時火箭可能
+        #   早就開傘了,那不構成「剛剛送出的指令被收到」的證據。
+        # (火箭現行 5 態;st.md 12 態上機後此對映要改——12 態的 2=上升段)
+        prev_stage = self.ch_prev_stage.get(topic)
+        self.ch_prev_stage[topic] = data.stage
+        if prev_stage is not None and data.stage in (2, 3) and prev_stage not in (2, 3):
+            self._confirm_pyro(topic, "dpl", "STAGE")
+
+        # pyro 電源監測(火箭 PB1/PB0 ADC)
+        self._track_pyro_power(topic, data)
+        # 鏈路品質:用火箭的發送序號跳號量化掉包
+        self._track_link_quality(topic, data)
+        # 氣壓基準漂移:地面上 RH 應該 ≈0,不是 0 就是 ref_press 過期了
+        self._track_baro_drift(topic, data)
 
         # 收包瞬間該通道 LED 亮綠脈衝(下一輪 check_heartbeats 200ms 內覆蓋回狀態色)。
         # Backend Offline 狀態不閃:命令路徑疑似死亡時不給「健康綠」的假象。
@@ -1115,7 +1328,11 @@ class MainWindow(QMainWindow):
             #   偶發 false-negative(GUI 卡頓漏 50ms timeout/探針快取窗)不得
             #   壓過它——否則 log 每 200ms 洗「offline↔resumed」+LED 綠紫頻閃。
             has_fresh_data = (last_time is not None and now - last_time < 1.5)
-            if not self._backend_online_cached(ch, now) and not has_fresh_data:
+            # 格式錯誤證據:backend 5s 內回報過解析失敗=資料在流(也證明後端活著)
+            fmt_recent = (ch in self.ch_last_fmt_err
+                          and now - self.ch_last_fmt_err[ch] < 5.0)
+            if not self._backend_online_cached(ch, now) and not has_fresh_data \
+                    and not fmt_recent:
                 short = f"{ch} {port} ✖後端未啟動"
                 color = "#9933FF" if int(now * 2) % 2 == 0 else "#442266"
                 self._set_led(ch, color, "#6600CC", "Backend Offline(紫=後端服務未啟動)")
@@ -1124,9 +1341,26 @@ class MainWindow(QMainWindow):
                     self.logger.warning(f"Telemetry backend daemon for channel '{ch}' is offline! "
                                         f"Please start main.py or run_persist_backend.bat. (紫燈=此狀態)")
                 if is_focus:
-                    self.ui.serial_label.setText(
-                        f"port︰{port}｜baudrate︰{baud}｜Status︰Backend Offline (後端服務未啟動)")
+                    self._refresh_detail_label(ch, baud)
                 self._set_port_label(ch, short, "#B366FF")
+                continue
+
+            # ★格式錯誤黃燈:資料狂流但每行解析都失敗≠「無資料」——插錯裝置/
+            #   鮑率錯/對到別人訊號時,橙色 No Data 會把人帶去查天線(錯方向)。
+            #   有 fresh 遙測時不搶(偶發壞行免驚擾)。
+            if fmt_recent and not has_fresh_data:
+                status_txt = "Format Error (資料流入但解析全失敗)"
+                color = "#FFD600" if int(now * 2) % 2 == 0 else "#665500"
+                self._set_led(ch, color, "#AA8800",
+                              "Format Error(黃=有資料流但看不懂:查裝置/鮑率/頻段)")
+                self.channel_status[ch] = "Format Error"
+                if prev_status != "Format Error":
+                    self.logger.error(
+                        f"⚠ Channel '{ch}' receiving data but ALL lines fail to parse! "
+                        f"Wrong device on {port}? Wrong baudrate? Foreign signal? (黃燈=此狀態)")
+                self._set_port_label(ch, f"{ch} {port} ⚠格式錯", "#FFDD44")
+                if is_focus:
+                    self._refresh_detail_label(ch, baud)
                 continue
 
             if last_time is None:
@@ -1160,14 +1394,373 @@ class MainWindow(QMainWindow):
                     self._set_port_label(ch, f"{ch} {port} ✖{elapsed:.0f}s", "#FF6666")
 
             if is_focus:
-                self.ui.serial_label.setText(f"port︰{port}｜baudrate︰{baud}｜Status︰{status_txt}")
+                self._refresh_detail_label(ch, baud)
+
+        # ── R1:pyro 指令逾時未見下行確認 → LOUD 告警(開環變閉環的另一半)──
+        for key in [k for k, p in self.pending_confirms.items() if now > p["deadline"]]:
+            pch, paction = key
+            del self.pending_confirms[key]
+            self.logger.error(
+                f"🔴 [UNCONFIRMED] {pch} {paction.upper()} 已送出但 10s 內未見下行確認"
+                f"(MSG SUCCESS / stage 轉開傘皆無)——火箭可能沒收到,或遙測中斷。"
+                f"確認另一板狀態後考慮重發;勿因單板未確認而中止(冗餘設計)。")
+            self.broadcast_event(f"[🔴 {pch} {paction.upper()} 未確認]", "#FF3B30")
+
+    def _refresh_detail_label(self, ch: str, baud):
+        """右側詳細列。★與左側簡版整合(2026-07-26):簡版已經逐頻道顯示
+        「COM 號 + 連線狀態 + pyro 電壓」,詳細版再印一次 port/status 純屬重複、
+        還把有限的橫向空間吃掉。改成只補簡版沒有的東西——焦點板的硬體識別
+        (VID/PID,插錯 dongle 一眼看穿)與連線參數。"""
+        port = self.channel_configs.get(ch, {}).get("port", "N/A")
+        hw = self._port_hw_info(port)
+        # 焦點標記 ▶ 只放在左側簡版一次,這裡不再重複(先前兩邊都印 ▶chN)
+        self.ui.serial_label.setText(f"{ch}｜{hw or '未知裝置'}｜{baud} 8N1")
+        self.ui.serial_label.setToolTip(
+            f"{ch} = {port}\n"
+            + (f"硬體:{hw}" if hw else "查不到 VID/PID:裝置未插上,或驅動未提供識別碼"))
 
     def _set_port_label(self, ch: str, text: str, color: str):
         lbl = self.ch_port_labels.get(ch)
         if lbl:
+            # R4:火箭端回讀的 ARMED 視窗倒數直接掛在簡版狀態列(每板獨立)
+            armed_left = self.ch_armed_until.get(ch, 0) - time.time()
+            if armed_left > 0:
+                text += f" 🔓ARM{armed_left:.0f}s"
+            # 焦點板加箭頭:單板指令(/dpl、/arm…)打到哪塊板一眼可辨
+            if ch == self.focus_channel:
+                text = "▶" + text
+            # pyro 電源狀態(10s 內的量測才顯示,過期不留舊值誤導)
+            pv = self.ch_pyro_volt.get(ch)
+            if pv and time.time() - pv[2] < 10.0:
+                vf, va = pv[0], pv[1]
+                if 0 <= vf < self._PYRO_LIVE_V:
+                    text += " 🔴熔斷"
+                elif va >= self._PYRO_LIVE_V:
+                    text += f" 🔓武裝{va:.1f}V"
+                elif vf >= self._PYRO_LIVE_V:
+                    lvl = self._batt_level(vf)
+                    icon = {"ok": "🔋", "low": "🪫", "crit": "🪫⚠"}.get(lvl, "🔒")
+                    text += f" {icon}{vf:.1f}V"
+            # 鏈路到達率(靠火箭序號跳號算出來的,不是訊號強度)
+            lt = self._link_text(ch)
+            if lt:
+                text += " " + lt[0]
             lbl.setText(text)
             lbl.setStyleSheet(f"color: {color};")
+            hw = self._port_hw_info(self.channel_configs.get(ch, {}).get("port"))
+            lbl.setToolTip(hw or "無硬體識別資訊(裝置未插或 VID/PID 不可讀)")
 
+    def _port_hw_info(self, port) -> str:
+        """查 COM 埠的 VID/PID+產品名(30s 快取)。回傳如
+        'FT232R USB UART [0403:6001]',查不到回 None——用於分辨
+        「哪個 dongle 是哪個頻段」,COM 號換插孔就變、VID/PID 不會。"""
+        now = time.time()
+        if now - self._ports_scan_ts > 30.0:
+            try:
+                import serial.tools.list_ports as _lp
+                self._ports_cache = {p.device.lower(): p for p in _lp.comports()}
+            except Exception:
+                self._ports_cache = {}
+            self._ports_scan_ts = now
+        p = self._ports_cache.get(str(port or "").lower())
+        if not p:
+            return None
+        vidpid = (f"{p.vid:04X}:{p.pid:04X}"
+                  if p.vid is not None and p.pid is not None else "????")
+        name = (p.product or p.description or "").strip()
+        return f"{name} [{vidpid}]" if name else f"[{vidpid}]"
+
+
+    # ── R1/R4:火箭下行 MSG 事件的結構化解析(閉環的下行半邊)──────
+    _MSG_RE = re.compile(r"^🚀 \[ROCKET MSG\] \[(\w+)\] (.*)$")
+    _MSG_COLORS = {"SUCCESS": "#00C853", "WARN": "#FF9100", "WARNING": "#FF9100",
+                   "ERROR": "#FF3B30", "ERR": "#FF3B30", "FAIL": "#FF3B30"}
+
+    def _handle_rocket_msg(self, ch: str, message: str):
+        """解析火箭 MSG 事件:ARMED 回讀(R4)、pyro 下行確認(R1)、圖表標記。
+        burst 4 連發會重複命中——確認/解除都冪等,標記只在首次觸發。"""
+        m = self._MSG_RE.match(message)
+        if not m:
+            return
+        level, content = m.group(1).upper(), m.group(2)
+
+        if "MANUAL ARMED" in content:
+            mm = re.search(r"within (\d+)s", content)
+            secs = int(mm.group(1)) if mm else 30
+            already = self.ch_armed_until.get(ch, 0) > time.time()
+            self.ch_armed_until[ch] = time.time() + secs
+            if not already:
+                self.logger.warning(f"🔓 [{ch}] Rocket confirms ARMED ({secs}s window)")
+                self.broadcast_event(f"[🔓 {ch} ARMED]", "#FF9100")
+        elif "MANUAL SAFE" in content or "ARM expired" in content:
+            self.ch_armed_until.pop(ch, None)
+        elif "Parachute deployed successfully" in content:
+            self._confirm_pyro(ch, "dpl", "MSG")
+        elif "Airbag inflation started" in content:
+            self._confirm_pyro(ch, "abg", "MSG")
+        elif "REJECT" in content:
+            # 指令被火箭閘門拒收:等待確認中的板要立刻知道,不必空等 10s。
+            # ★必須比對「被拒的是哪一道指令」:舊版只比對頻道,結果一句
+            #   RECAL/SETCH 的拒收會把待確認的開傘指令一起清掉,而且把紅色
+            #   告警貼上「DPL 被拒收」的錯誤標籤——操作員會以為開傘指令失敗。
+            low = content.lower()
+            if "already deployed" in low:
+                # 語意是「傘已經開了」= 開傘的證據,不是失敗。burst 第 2~4 發
+                # 必然收到這句;SUCCESS 幀掉包時這是唯一的線索,不可誤報成紅色失敗。
+                self._confirm_pyro(ch, "dpl", "MSG(already deployed)")
+                return
+            # 韌體的 pyro 拒收會自報 dpl/abg;非 pyro 指令(recal/setch/channel)
+            # 一律不動 pending——它們跟火工品無關。
+            acts = [a for a in ("dpl", "abg") if a in low]
+            if not acts:
+                if any(t in low for t in ("recal", "setch", "channel")):
+                    self.logger.warning(f"⚠ [{ch}] 非火工品指令被拒收:{content}")
+                    return
+                # 舊韌體的拒收訊息不帶指令名(向後相容):只能全清,但講清楚
+                acts = ["dpl", "abg"]
+                self.logger.warning(
+                    f"⚠ [{ch}] 火箭回報拒收但未指明指令(舊版韌體):{content}")
+            hit = [k for k in self.pending_confirms if k[0] == ch and k[1] in acts]
+            for k in hit:
+                del self.pending_confirms[k]
+                self.logger.error(f"🚫 [{ch}] {k[1].upper()} REJECTED by rocket: {content}")
+            if hit:
+                self.broadcast_event(f"[🚫 {ch} REJECT]", "#FF3B30")
+        elif level in ("ERROR", "ERR", "FAIL"):
+            self.broadcast_event(f"[{ch}] {content[:36]}", self._MSG_COLORS["ERROR"])
+
+    # ── 鏈路品質:用火箭的發送序號量化掉包 ──────────────────────────
+    _LINK_WINDOW = 40     # 滾動視窗(2Hz → 約 20 秒)
+    _LINK_MIN_N  = 8      # 少於這麼多樣本不下結論(剛連上時別亂報)
+
+    def _track_link_quality(self, ch: str, data):
+        """火箭每發一包 SQ 遞增 1。地面端只要看序號跳號就知道掉了幾包——
+        這是唯一能量化「RF 到達率」的資料,而且火箭本來就在數了,只是
+        以前沒放進封包(CSV 的 lora_seq 因此恆為 0)。
+        seq==0 表示舊韌體沒帶這欄位,直接不做統計。"""
+        seq = getattr(data, "lora_seq", 0)
+        if not seq:
+            return
+        dq = self.ch_seq.get(ch)
+        if dq is None:
+            dq = deque(maxlen=self._LINK_WINDOW)
+            self.ch_seq[ch] = dq
+        # 序號倒退 = 火箭重開機(序號歸零)→ 舊樣本作廢,重新起算
+        if dq and seq < dq[-1]:
+            dq.clear()
+            self.logger.info(f"[{ch}] 序號重置(火箭重新開機?),掉包統計重新起算")
+        dq.append(seq)
+        if len(dq) >= self._LINK_MIN_N:
+            span = dq[-1] - dq[0] + 1          # 這段期間火箭「應該」發了幾包
+            if span > 0:
+                self.ch_link[ch] = (len(dq) / span, len(dq))
+
+    def _link_text(self, ch: str):
+        """回傳 (顯示字串, 顏色);資料不足回 None。"""
+        lk = self.ch_link.get(ch)
+        if not lk:
+            return None
+        rate, n = lk
+        pct = max(0.0, min(1.0, rate)) * 100.0
+        color = "#66DD66" if pct >= 90 else ("#FFDD44" if pct >= 70 else "#FF6666")
+        return (f"📶{pct:.0f}%", color)
+
+    # pyro 電源判讀門檻(2S 鋰電:8.4V 滿 / 7.4V 標稱 / 6.0V 空)
+    _PYRO_LIVE_V = 5.0    # 高於此 = 該段線路確實帶電
+    _PYRO_LOW_V  = 7.0    # 低於此 = 電量偏低(約剩 20%),發射前應更換
+    _PYRO_CRIT_V = 6.6    # 低於此 = 電量危險(約剩 5%),不應繼續飛
+
+    # ── 氣壓基準漂移門檻(公尺)。換算:1 hPa ≈ 8.3 m ─────────────────────
+    _BARO_DRIFT_WARN = 5.0    # 該重新校準了
+    _BARO_DRIFT_HIGH = 10.0   # 誤判離架已【無法撤銷】(火箭端 REVOKE_ALT_M)
+    _BARO_DRIFT_CRIT = 20.0   # C 備援的 20m 地面保護【已失效】(DEPLOY_PEAK_MIN_M)
+
+    def _track_baro_drift(self, ch: str, data):
+        """地面待機時,RH 顯示的數字就是 ref_press 的漂移量。
+
+        火箭沒動,rel_alt = 44330·(1 − (P/ref_press)^0.1903) 卻不是 0,
+        就只可能是開機時記下的基準已經過期(天氣變化、在發射台等太久)。
+
+        這不影響開傘判斷——cond_A 判的是「低於峰值 10m」,是**差值**,基準
+        平移會抵消掉。但火箭端有兩道判**絕對值**的閘門會被打壞:
+
+            漂 10 m(1.2 hPa) → 誤判離架後無法撤銷(rel_alt < REVOKE_ALT_M 永不成立)
+            漂 20 m(2.4 hPa) → C 備援的 20m 地面保護失效(peak 一開始就超標)
+
+        在發射台等幾小時就可能漂到。處置很簡單:按「校準 ALL」。
+        只在 IDLE(stage 0)判定——飛起來之後 RH 本來就該是大數字。
+        """
+        if getattr(data, "stage", -1) != 0:
+            self._prev_drift_level.pop(ch, None)
+            return
+        try:
+            drift = abs(float(data.rel_height))
+        except (TypeError, ValueError):
+            return
+        if drift >= self._BARO_DRIFT_CRIT:
+            lvl = "crit"
+        elif drift >= self._BARO_DRIFT_HIGH:
+            lvl = "high"
+        elif drift >= self._BARO_DRIFT_WARN:
+            lvl = "warn"
+        else:
+            lvl = "ok"
+
+        prev = self._prev_drift_level.get(ch)
+        if lvl == prev:
+            return                      # 同級不重複洗版
+        self._prev_drift_level[ch] = lvl
+        if lvl == "ok":
+            if prev is not None:
+                self.logger.info(f"✅ [{ch}] 氣壓基準已歸零({drift:.1f} m)")
+            return
+        hpa = drift / 8.3
+        if lvl == "crit":
+            self.logger.error(
+                f"🔴 [{ch}] 氣壓基準漂移 {drift:.1f} m({hpa:.1f} hPa)"
+                f"——C 備援的 20m 地面保護已失效!發射前務必按「校準 ALL」")
+            self.broadcast_event(f"[🔴 {ch} 基準漂移 {drift:.0f}m]", "#FF3B30")
+        elif lvl == "high":
+            self.logger.error(
+                f"🟠 [{ch}] 氣壓基準漂移 {drift:.1f} m({hpa:.1f} hPa)"
+                f"——誤判離架後已無法撤銷。請按「校準 ALL」")
+            self.broadcast_event(f"[🟠 {ch} 基準漂移 {drift:.0f}m]", "#FF9100")
+        else:
+            self.logger.warning(
+                f"⚠ [{ch}] 氣壓基準漂移 {drift:.1f} m({hpa:.1f} hPa)"
+                f"——建議按「校準 ALL」重設零點")
+
+
+    # ── 上升段的 /dpl 二次確認 ────────────────────────────────────────────
+    # 韌體只擋離架後前 10 秒，但頂點在 13.5~16.7 秒（3.0.8 的 81 組模擬）。
+    # 也就是第 10 秒到頂點之間，文字指令 /dpl 會被火箭接受 —— 那時仍在上升、
+    # 動壓最大，開傘等於解體。
+    #
+    # 但**不能無條件加確認**：真正的緊急情境（過了頂點、傘沒開）也是 stage 1，
+    # 那時多一道手續是在偷走你最缺的東西。
+    # 所以只擋「還在往上」這個唯一會出事的情況 —— 用遙測的 vz 判斷，
+    # 下降中直接送出，行為與現在完全相同。
+    _ASCENT_VZ = 2.0        # m/s，超過視為仍在上升
+
+    def _ascent_guard(self, chans, action: str) -> bool:
+        """回傳 True = 擋下來了（要求再輸入一次）。下降中或無資料時放行。
+
+        用焦點頻道的 vz 判斷就夠 —— 兩塊板裝在**同一枚火箭**上，看到的是
+        同一條軌跡。沒有資料時一律放行（不知道就不要擋緊急指令）。"""
+        d = self.latest_data
+        if d is None:
+            self._pending_ascent = None
+            return False
+        if not (getattr(d, "stage", 0) == 1 and getattr(d, "vz", 0.0) > self._ASCENT_VZ):
+            self._pending_ascent = None
+            return False
+        rising = [f"+{d.vz:.1f} m/s"]
+        key = (action, tuple(chans))
+        if getattr(self, "_pending_ascent", None) == key:
+            self._pending_ascent = None
+            self.logger.warning(f"⚠ 已確認：在上升段送出 {action.upper()}")
+            return False
+        self._pending_ascent = key
+        self.logger.error(
+            f"🛑 火箭仍在上升（{', '.join(rising)}）—— 上升段開傘會解體。"
+            f"確定要送就再輸入一次同樣的指令。")
+        self.broadcast_event("[🛑 上升中，再按一次確認]", "#FF3B30")
+        return True
+
+    def _batt_level(self, vf: float) -> str:
+        """2S 鋰電電壓分級。刻意不換算成百分比——鋰電在變動負載下的
+        電壓↔電量關係非線性,硬報一個百分比會給出比實際更精確的假象。"""
+        if vf < 0 or vf < self._PYRO_LIVE_V:
+            return "na"
+        if vf < self._PYRO_CRIT_V:
+            return "crit"
+        if vf < self._PYRO_LOW_V:
+            return "low"
+        return "ok"
+
+    def _track_pyro_power(self, ch: str, data):
+        """追蹤火箭下行的 pyro 電源電壓,狀態翻轉時發告警。
+        VF(保險絲後端):掉到 0V = 熔斷。誤觸發時電流走 safety shunt 燒斷保險絲
+          ——點火頭沒被點著(人安全),但整條 pyro 電源同時死亡,不修就上天 = 傘開不了。
+        VA(arming 開關後端):>0V = 已武裝,這是規範 4.6.7 要求的「遠端驗證啟動狀態」。
+        -1 = 該板韌體沒有這個功能(舊版),不做任何判讀。"""
+        vf = getattr(data, "v_fuse", -1.0)
+        va = getattr(data, "v_arm", -1.0)
+        if vf < 0 and va < 0:
+            return
+        self.ch_pyro_volt[ch] = (vf, va, time.time())
+
+        blown = (0 <= vf < self._PYRO_LIVE_V)
+        armed = (va >= self._PYRO_LIVE_V)
+
+        # ── 電量分級警告(只在「變差」時出聲,回升不吵)──────────────
+        # ★這段必須放在下面的 early return 之前:舊版把它擺在後面,
+        #   只有 blown/armed 翻轉時才會走到 → 低電量警告等同死碼。
+        lvl = self._batt_level(vf)
+        if lvl != "na":
+            prev_lvl = self._prev_batt_level.get(ch)
+            if prev_lvl != lvl:
+                self._prev_batt_level[ch] = lvl
+                rank = {"ok": 0, "low": 1, "crit": 2}
+                if prev_lvl is not None and rank[lvl] > rank[prev_lvl]:
+                    if lvl == "crit":
+                        self.logger.error(
+                            f"🔋 [{ch}] 電量危險 {vf:.2f}V(2S 低於 {self._PYRO_CRIT_V}V,"
+                            f"約剩 5%)——不應繼續飛行,立即更換電池")
+                        self.broadcast_event(f"[🔋 {ch} 電量危險]", "#FF3B30")
+                    else:
+                        self.logger.warning(
+                            f"🔋 [{ch}] 電量偏低 {vf:.2f}V(2S 低於 {self._PYRO_LOW_V}V,"
+                            f"約剩 20%)——發射前建議更換")
+                elif prev_lvl is not None and lvl == "ok":
+                    self.logger.info(f"🔋 [{ch}] 電量恢復正常 {vf:.2f}V(已換電池?)")
+
+        prev = self._prev_pyro_flags.get(ch)
+        if prev == (blown, armed):
+            return
+        self._prev_pyro_flags[ch] = (blown, armed)
+
+        if prev is not None and blown != prev[0]:
+            if blown:
+                self.logger.error(
+                    f"🔴 [{ch}] PYRO FUSE BLOWN — 保險絲後端 {vf:.2f}V。"
+                    f"誤觸發已被並聯導線擋下(點火頭未點著),但這塊板現在「點不了火」。"
+                    f"發射前必須更換保險絲;另一板若正常仍可獨立完成回收。")
+                self.broadcast_event(f"[🔴 {ch} 保險絲熔斷]", "#FF3B30")
+            else:
+                self.logger.info(f"✅ [{ch}] pyro 電源恢復 {vf:.2f}V(保險絲已更換)")
+        if prev is not None and armed != prev[1]:
+            if armed:
+                self.logger.warning(f"🔓 [{ch}] PYRO ARMED — arming 開關已導通 {va:.2f}V"
+                                    f"(儲能裝置進入啟動狀態,人員勿靠近火箭)")
+                self.broadcast_event(f"[🔓 {ch} 已武裝]", "#FF9100")
+            else:
+                self.logger.info(f"🔒 [{ch}] pyro 已解除武裝(arming 開關斷開)")
+        # (電量警告已移到本函式開頭的 early return 之前——擺這裡永遠走不到)
+
+    def _confirm_pyro(self, ch: str, action: str, src: str, evidence_at: float = None):
+        """R1:收到火箭下行的點火證據(MSG SUCCESS 或 stage 轉入開傘)。
+        evidence_at = 這份證據產生的時刻;早於指令送出時刻的證據不予採信。"""
+        ev = time.time() if evidence_at is None else evidence_at
+        key = (ch, action)
+        first = key not in self.ch_pyro_confirmed
+        self.ch_pyro_confirmed[key] = ev
+        pend = self.pending_confirms.get(key)
+        if pend is not None and ev >= pend["sent_at"]:
+            del self.pending_confirms[key]
+            self.logger.info(f"✅ [CONFIRMED] {ch} {action.upper()} verified via {src} downlink")
+            self.broadcast_event(f"[✅ {ch} {action.upper()} OK]", "#00C853")
+        elif first:
+            # 沒按過鈕卻收到開傘證據=自動開傘(正常飛行)或另一位操作員,標記即可
+            self.broadcast_event(f"[✅ {ch} {action.upper()}]", "#00C853")
+
+    def _register_confirm(self, chs, action: str):
+        """R1:pyro 指令送出時登記「等待下行確認」,10s 未見證據 → LOUD 告警。
+        ★記下送出時刻:確認只能由「這次指令之後」出現的證據滿足。否則備援
+          指令會被上一次開傘留下的舊狀態瞬間「確認」,即使上行早已中斷。"""
+        now = time.time()
+        for c in chs:
+            self.pending_confirms[(c, action)] = {"sent_at": now, "deadline": now + 10.0}
 
     def poll_zmq_data(self):
         """非阻塞讀取 ZMQ 消息，保證 UI 流暢不被卡死"""
@@ -1186,11 +1779,14 @@ class MainWindow(QMainWindow):
                     level = getattr(logging, level_str, logging.INFO)
                     logging.getLogger(logger_name).log(level, message)
 
-                    # 若收到火箭端特有的 MSG 事件，於圖表與地圖上標示
-                    if message.startswith("MSG "):
-                        # 轉義單引號，防止 JS addEventMarker 呼叫被截斷
-                        safe_msg = message[4:].replace("'", "\\'").replace('"', '\\"')
-                        self.broadcast_event(f"[MSG] {safe_msg}", "#FF3B30")
+                    ch = topic[:-4]   # "ch1_log" -> "ch1"
+                    # 格式錯誤黃燈證據:communicator 每行解析失敗都 logger.error 這個前綴
+                    if message.startswith("Format error:"):
+                        self.ch_last_fmt_err[ch] = time.time()
+                    # 火箭 MSG 事件(communicator 已改寫成 🚀 前綴;
+                    # 舊版 startswith("MSG ") 判斷永遠不命中=死碼,已由此取代)
+                    elif message.startswith("🚀 [ROCKET MSG]"):
+                        self._handle_rocket_msg(ch, message)
                     continue
 
                 sensor_data = SensorData.from_dict(payload_dict)

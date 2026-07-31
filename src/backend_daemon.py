@@ -26,6 +26,13 @@ class ZmqPublishObserver(DataObserver):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.socket.bind(f"tcp://127.0.0.1:{zmq_port}")
+        # ★ZMQ socket 不是執行緒安全的。這顆 PUB socket 同時被兩邊使用:
+        #   (a) 本觀察者(communicator 的處理執行緒)發遙測
+        #   (b) ZmqLogHandler —— logging 是全域的,任何執行緒記一條 log 都會觸發
+        #   並發呼叫 send_multipart 會讓多段訊息交錯,收到的幀就此損毀。
+        #   用同一把鎖序列化所有送出。RLock 而非 Lock:送出失敗時的 except 會
+        #   self.logger.error(),那會在同一執行緒內再次進到 emit() → 需可重入。
+        self.send_lock = threading.RLock()
         self.logger = logging.getLogger(f"ZmqPublishObserver_{topic}")
         self.logger.info(f"ZMQ PUB socket bound to port {zmq_port} for topic '{topic}'")
 
@@ -42,10 +49,11 @@ class ZmqPublishObserver(DataObserver):
                 data_dict["gs_timestamp"] = time.time()
                 
                 # ZMQ Multipart 封包傳輸 [Topic, Payload]
-                self.socket.send_multipart([
-                    self.topic.encode('utf-8'),
-                    json.dumps(data_dict).encode('utf-8')
-                ])
+                with self.send_lock:
+                    self.socket.send_multipart([
+                        self.topic.encode('utf-8'),
+                        json.dumps(data_dict).encode('utf-8')
+                    ])
             except Exception as e:
                 self.logger.error(f"Failed to publish data via ZMQ: {e}")
 
@@ -54,11 +62,14 @@ class ZmqPublishObserver(DataObserver):
 
 
 class ZmqLogHandler(logging.Handler):
-    """ZMQ 日誌轉發器：將後端進程中的日誌（如連線、重試日誌）封裝並透過 ZMQ PUB 發送至主介面"""
-    def __init__(self, zmq_socket, topic: str):
+    """ZMQ 日誌轉發器：將後端進程中的日誌（如連線、重試日誌）封裝並透過 ZMQ PUB 發送至主介面。
+    ★send_lock 必須是 ZmqPublishObserver 那把——兩者共用同一顆 PUB socket，
+      而 logging 會從任意執行緒觸發本 emit()，不序列化就會與遙測交錯損毀。"""
+    def __init__(self, zmq_socket, topic: str, send_lock):
         super().__init__()
         self.zmq_socket = zmq_socket
         self.topic = f"{topic}_log" # 例如 "ch1_log"
+        self.send_lock = send_lock
 
     def emit(self, record):
         try:
@@ -67,10 +78,11 @@ class ZmqLogHandler(logging.Handler):
                 "message": record.getMessage(),
                 "logger": record.name
             }
-            self.zmq_socket.send_multipart([
-                self.topic.encode('utf-8'),
-                json.dumps(log_entry).encode('utf-8')
-            ])
+            with self.send_lock:
+                self.zmq_socket.send_multipart([
+                    self.topic.encode('utf-8'),
+                    json.dumps(log_entry).encode('utf-8')
+                ])
         except Exception:
             self.handleError(record)
 
@@ -224,7 +236,7 @@ def main():
     communicator.add_observer(zmq_pub_obs)
 
     # 💡 註冊 ZMQ 日誌轉發 Handler，用以將背景串列埠連接日誌傳回 GUI
-    zmq_log_handler = ZmqLogHandler(zmq_pub_obs.socket, channel_id)
+    zmq_log_handler = ZmqLogHandler(zmq_pub_obs.socket, channel_id, zmq_pub_obs.send_lock)
     logging.getLogger().addHandler(zmq_log_handler)
 
     # 6. 啟動 ZMQ REQ/REP 指令控制端點線程

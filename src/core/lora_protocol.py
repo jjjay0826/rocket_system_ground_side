@@ -7,6 +7,7 @@ class LoraCommand:
     ARM = ("arm", b"#CMD:ARM_SYSTEM_SALT7763#\r\n", "系統遠端解鎖 (ARM)")
     DPL = ("dpl", b"#CMD:FORCE_DPL_SALT9981#\r\n", "遠端強制開傘 (DPL)")
     ABG = ("abg", b"#CMD:OPEN_ABG_SALT8872#\r\n", "開啟氣囊 (ABG)")
+    CAL = ("cal", b"#CMD:RECAL_SALT5566#\r\n", "氣壓零點重校 (RECAL)")
 
     @classmethod
     def get_token(cls, action: str) -> Tuple[bytes, str]:
@@ -18,6 +19,12 @@ class LoraCommand:
             return cls.DPL[1], cls.DPL[2]
         elif action_lower == "abg":
             return cls.ABG[1], cls.ABG[2]
+        elif action_lower == "cal":
+            return cls.CAL[1], cls.CAL[2]
+        elif action_lower.startswith("setch_"):
+            # 換頻:#CMD:SETCH_72# → 922.125MHz(E22-900T22D: 850.125 + ch)
+            ch = action_lower.split("_", 1)[1]
+            return f"#CMD:SETCH_{ch}#\r\n".encode("utf-8"), f"切換 LoRa 頻道 (CH{ch})"
         else:
             token = f"#CMD:{action}#\r\n".encode('utf-8')
             label = f"自訂遠端指令 ({action})"
