@@ -1264,7 +1264,10 @@ class MainWindow(QMainWindow):
             f"當前偏角: {current_dev:.1f}° | 最大偏角: {self.max_deviation_angle:.1f}°"
         )
 
-        is_new_event, ev_name, ev_color = self.stage_display.update(data.stage, data.timestamp)
+        # ★把火箭自己的 uptime 一起傳進去 —— 飛行時間軸要用火箭的時鐘，
+        # 不是地面站收到封包的牆上時間（見 stage_display._rel）。
+        is_new_event, ev_name, ev_color = self.stage_display.update(
+            data.stage, data.timestamp, getattr(data, "timestamp_ms", None))
         if is_new_event:
             self.broadcast_event(f"[{ev_name}]", ev_color)
 
@@ -1277,14 +1280,17 @@ class MainWindow(QMainWindow):
             if (not math.isnan(getattr(data, "total_accel", float("nan")))
                     and data.total_accel < 1.15
                     and getattr(self, "_seen_boost", False)):
-                if self.stage_display.mark_derived("BURNOUT", data.timestamp, "#FF9100"):
+                if self.stage_display.mark_derived(
+                        "BURNOUT", data.timestamp, "#FF9100",
+                        getattr(data, "timestamp_ms", None)):
                     self.broadcast_event("[BURNOUT]", "#FF9100")
             if getattr(data, "total_accel", 0.0) > 1.5:
                 self._seen_boost = True
         elif data.stage == 2:
             # APOGEE：進入開傘的那一刻，峰值已經確定
             if self.stage_display.mark_derived(
-                    f"APOGEE {self.max_height:.0f}m", data.timestamp, "#FFD600"):
+                    f"APOGEE {self.max_height:.0f}m", data.timestamp, "#FFD600",
+                    getattr(data, "timestamp_ms", None)):
                 self.broadcast_event(f"[APOGEE {self.max_height:.0f}m]", "#FFD600")
         # Update health status labels based on failedTasks (0:BMP, 1:IMU, 2:LoRa, 3:SD)
         health_map = [

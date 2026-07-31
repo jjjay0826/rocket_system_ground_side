@@ -84,11 +84,58 @@ def run():
     c.eq("走完 0→4 目前停在 LANDED", sd.current_row, ST_ROW[4])
     c.eq("五個火箭狀態都造訪過", sorted(sd.visited_rows),
          sorted(ST_ROW.values()))
-    rel = (sd.row_times[ST_ROW[2]] - sd.row_times[T0_STAGE]).total_seconds()
+    rel = (sd.row_times[ST_ROW[2]][0] - sd.row_times[T0_STAGE][0]).total_seconds()
     c.check("開傘時間相對離架而非相對開傘", abs(rel - 16.7) < 1e-6,
             f"T+{rel:.2f}s（若 T0 錯錨在開傘，這裡會是 0.00）")
     c.eq("★畫面列數＝完整飛行序列（不是只有 5 列）",
          len(sd._labels()), len(FLIGHT_SEQUENCE))
+
+    # ── ★飛行時間軸必須用【火箭自己的時鐘】，不是收包的牆上時間 ──────
+    # 牆上時間會把鏈路延遲與 GUI 處理延遲算進 T+，而且回放加速時整條
+    # 時間軸會等比例縮放（--speed 4 跑出來落地顯示 T+40.63s 而非 T+162s）。
+    sd.reset()
+    W = datetime(2026, 8, 1, 1, 0, 0)
+    # 牆上時間刻意壓縮成 1/4（模擬 --speed 4），火箭 uptime 給真實值
+    for st, sim_s in ((0, 0.0), (1, 1.11), (2, 15.95), (3, 16.95), (4, 163.7)):
+        sd.update(st, W + timedelta(seconds=sim_s / 4.0),
+                  rocket_ms=int(10000 + sim_s * 1000))
+    lab = sd._labels()
+
+    def row_of(name):
+        return next(i for i, (n, _, _) in enumerate(FLIGHT_SEQUENCE) if n == name)
+
+    for name, want in (("DEPLOYING", 14.84), ("DEPLOYED", 15.84), ("LANDED", 162.59)):
+        txt = lab[row_of(name)]
+        m = re.search(r"\(T([+-][\d.]+)s\)", txt)
+        got = float(m.group(1)) if m else None
+        c.check(f"★{name} 用火箭時鐘 T{want:+.2f}s（不是牆上時間 T{want/4:+.2f}s）",
+                got is not None and abs(got - want) < 0.02,
+                f"實際 {txt.strip()}")
+
+    # 負的 T+ 要顯示成 T−，不是 "T+-"
+    sd.reset()
+    sd.update(0, W, rocket_ms=8000)
+    sd.update(1, W + timedelta(seconds=2), rocket_ms=10000)
+    idle_txt = sd._labels()[row_of("IDLE")]
+    c.check("★離架前的列顯示 T−x.xx（不是 T+-x.xx）",
+            "T-2.00s" in idle_txt and "T+-" not in idle_txt,
+            f"實際 {idle_txt.strip()}")
+
+    # 沒有火箭時鐘（舊韌體）時要退回牆上時間，不能整欄消失
+    sd.reset()
+    sd.update(1, W)
+    sd.update(2, W + timedelta(seconds=15.0))
+    c.check("沒有 uptime 時退回牆上時鐘",
+            "(T+15.00s)" in sd._labels()[row_of("DEPLOYING")],
+            sd._labels()[row_of("DEPLOYING")].strip())
+
+    # 火箭中途重開（uptime 歸零）→ 退回牆上時鐘，不要顯示大負數
+    sd.reset()
+    sd.update(1, W, rocket_ms=200000)
+    sd.update(2, W + timedelta(seconds=15.0), rocket_ms=3000)   # 重開了
+    txt = sd._labels()[row_of("DEPLOYING")]
+    c.check("★uptime 倒退（火箭重開）時退回牆上時鐘",
+            "(T+15.00s)" in txt, f"實際 {txt.strip()}")
 
     sd.reset()
     sd.update(9, t0)          # 越界：韌體真的改成 12 態時的行為

@@ -103,7 +103,7 @@ class StageDisplayer:
         self.visited_rows = set()          # 火箭真的回報過的列
         self.derived_rows = {}             # row -> (顯示名, timestamp)
         self.marked_events = set()
-        self.row_times = {}                # row -> 首次達到的時間戳
+        self.row_times = {}                # row -> (牆上時間, 火箭 uptime ms 或 None)
         self.extra = []                    # 不在序列裡的推導事件，附在最後
 
         # 暫時移除滑鼠點擊/選中高亮變白功能：禁用選取與焦點
@@ -118,24 +118,54 @@ class StageDisplayer:
         self.list_widget.setItemDelegate(CustomDelegate())
 
     # ──────────────────────────────────────────────────────────────
-    def _rel(self, ts):
-        if ts is None or T0_ROW not in self.row_times:
+    def _rel(self, ts, ms=None, row=None):
+        """相對 T0 的時間。★優先用【火箭自己的時鐘】（遙測 T 欄的 uptime）。
+
+        原本只用 data.timestamp —— 那是地面站【收到封包的牆上時間】。
+        兩個問題：
+          · 它把鏈路延遲與 GUI 處理延遲都算進 T+ 裡。事後分析開傘時序時，
+            那些延遲會被當成飛行事件的時間差。
+          · 回放/加速播放時整條時間軸會等比例縮放（--speed 4 跑出來，
+            落地顯示 T+40.63s 而不是 T+162s）。
+
+        火箭每一包都帶自己的 uptime，兩個事件相減就是真正的飛行時間差，
+        與鏈路狀況、與播放速度都無關。收不到 uptime 才退回牆上時鐘。
+
+        火箭中途重開的話 uptime 會歸零，相減變成負數 —— 那時退回牆上時鐘
+        （韌體有 post-reset 救援，但時間軸本來就斷了）。
+
+        ★重開機不能靠「差值多負」判斷：發射台待機超過 30 分鐘是真實情境，
+          IDLE 那一列合理就是 T−1800s。判準要用【列號】——
+          T0 之後的列，uptime 不可能比 T0 小；小了就是重開過。
+          離架前的列則相反，本來就該是負的。
+        """
+        t0 = self.row_times.get(T0_ROW)
+        if t0 is None:
             return ""
-        return f"  (T+{(ts - self.row_times[T0_ROW]).total_seconds():.2f}s)"
+        t0_ts, t0_ms = t0
+        if ms is not None and t0_ms:
+            dt = (ms - t0_ms) / 1000.0
+            after_t0 = row is not None and row > T0_ROW
+            if not (after_t0 and dt < 0):       # 沒有 uptime 倒退（重開機）
+                return f"  (T{dt:+.2f}s)".replace("T+-", "T-")
+        if ts is None:
+            return ""
+        dt = (ts - t0_ts).total_seconds()
+        return f"  (T{dt:+.2f}s)".replace("T+-", "T-")
 
     def _labels(self):
         out = []
         for i, (name, hint, src) in enumerate(FLIGHT_SEQUENCE):
             shown = self.derived_rows.get(i, (name, None))[0] if src == "gnd" else name
             txt = f"  {shown}" + (f"　{hint}" if hint else "")
-            ts = self.row_times.get(i)
-            if ts is not None:
-                txt += "  (T0)" if i == T0_ROW else self._rel(ts)
+            rt = self.row_times.get(i)
+            if rt is not None:
+                txt += "  (T0)" if i == T0_ROW else self._rel(rt[0], rt[1], i)
             if src == "gnd":
                 txt += "　推導" if i in self.derived_rows else "　—"
             out.append(txt)
-        for name, ts, _ in self.extra:
-            out.append(f"  · {name}{self._rel(ts)}　地面推導")
+        for name, ts, _, ms in self.extra:
+            out.append(f"  · {name}{self._rel(ts, ms, len(FLIGHT_SEQUENCE))}　地面推導")
         return out
 
     def _rebuild(self):
@@ -172,7 +202,7 @@ class StageDisplayer:
                 item.setForeground(QBrush(QColor(140, 140, 140)))
 
     # ──────────────────────────────────────────────────────────────
-    def update(self, stage: int, timestamp: datetime = None):
+    def update(self, stage: int, timestamp: datetime = None, rocket_ms: int = None):
         """stage = 遙測 ST: 欄（火箭端 FlightState_t，0~4）。
 
         首次進入某個事件狀態時回傳 (True, 事件名, 顏色)，其餘回 (False, None, None)。
@@ -194,16 +224,18 @@ class StageDisplayer:
         if timestamp is None:
             timestamp = datetime.now()
         if row not in self.row_times:
-            self.row_times[row] = timestamp
+            self.row_times[row] = (timestamp, rocket_ms)
         # 容錯：直接收到 >T0 的狀態卻沒有 T0（開機時已在飛，或前段遙測全掉）
         if row > T0_ROW and T0_ROW not in self.row_times:
-            self.row_times[T0_ROW] = timestamp
+            self.row_times[T0_ROW] = (timestamp, rocket_ms)
             logger.warning("[STAGE] 沒收到離架幀，T0 以第一筆飛行幀代替 —— 時間軸不準")
 
         if row != self.current_row:
             old = (FLIGHT_SEQUENCE[self.current_row][0]
                    if self.current_row >= 0 else "NONE")
-            suffix = " (T0)" if row == T0_ROW else self._rel(self.row_times.get(row))
+            rt = self.row_times.get(row)
+            suffix = (" (T0)" if row == T0_ROW
+                      else (self._rel(rt[0], rt[1], row) if rt else ""))
             logger.info(f"[STAGE] {old} -> {FLIGHT_SEQUENCE[row][0]}{suffix}")
 
             # 只有【火箭列】被跳過才算遙測掉包；推導列本來就不是火箭送的
@@ -220,7 +252,7 @@ class StageDisplayer:
 
     # ──────────────────────────────────────────────────────────────
     def mark_derived(self, name: str, timestamp: datetime = None,
-                     color: str = "#FF9100"):
+                     color: str = "#FF9100", rocket_ms: int = None):
         """地面站自己從遙測推導出來的事件（火箭端沒有對應的狀態）。
 
         火箭的 5 個狀態刻意保持精簡 —— 它們是開傘決策實際在用的東西，
@@ -244,16 +276,17 @@ class StageDisplayer:
                 if i in self.derived_rows:
                     return False
                 self.derived_rows[i] = (name, timestamp)
-                self.row_times.setdefault(i, timestamp)
-                logger.info(f"[DERIVED] {name}{self._rel(timestamp)}"
+                self.row_times.setdefault(i, (timestamp, rocket_ms))
+                logger.info(f"[DERIVED] {name}{self._rel(timestamp, rocket_ms, i)}"
                             f"　（地面站推導，非火箭回報）")
                 self._rebuild()
                 return True
         # 不在序列裡：附在最後
-        if any(n == name for n, _, _ in self.extra):
+        if any(e[0] == name for e in self.extra):
             return False
-        self.extra.append((name, timestamp, color))
-        logger.info(f"[DERIVED] {name}{self._rel(timestamp)}　（地面站推導，非火箭回報）")
+        self.extra.append((name, timestamp, color, rocket_ms))
+        logger.info(f"[DERIVED] {name}{self._rel(timestamp, rocket_ms)}"
+                    f"　（地面站推導，非火箭回報）")
         self._rebuild()
         return True
 
