@@ -93,6 +93,50 @@ def run():
         got = w._chart_abbr(odd)
         c.check(f"未知標籤 {odd!r} → {got!r}（非空）", bool(got))
 
+    # ── ★事件標記必須畫在【觸發它的那一幀】，不是上一幀 ────────────
+    # update_ui 是在最後才 self.latest_data = data，而所有推導都跑在那之前。
+    # broadcast_event 若用 self.latest_data，每個標記就會早整整一個遙測
+    # 週期（2Hz → 0.5s）。畫面上：APOGEE 標在高度峰值左邊 0.5 秒，
+    # 開傘標記反而落在峰值上。事後論證開傘時序時每個事件系統性早半秒，
+    # 而 C 備援最小餘裕只有 1.69 秒。
+    import inspect
+    from src.core.models import SensorData
+    from _common import frame
+
+    sig = inspect.signature(w.broadcast_event)
+    c.check("★broadcast_event 收得下觸發幀（src_data）",
+            "src_data" in sig.parameters,
+            "沒有的話只能拿 self.latest_data —— 那是上一幀")
+
+    src = inspect.getsource(w.update_ui)
+    c.check("★推導事件有把觸發幀傳進去",
+            'self.broadcast_event(f"[{name}]", color, data)' in src,
+            "derive() 不傳 data 的話，標記會落在上一幀")
+    c.check("★狀態轉換事件也傳觸發幀",
+            "self.broadcast_event(f\"[{ev_name}]\", ev_color, data)" in src)
+
+    # 實測 x 位置：兩幀相差 0.5s，標記必須落在後面那一幀
+    w.reset_gui_state()
+    w.start_time = 0.0
+    prev = SensorData.from_new_format(frame(t=1000, sq=1))
+    prev.gs_timestamp = 100.0
+    cur = SensorData.from_new_format(frame(t=1500, sq=2))
+    cur.gs_timestamp = 100.5
+    w.latest_data = prev
+
+    got_x = []
+    real_add = w.chart_1.add_event_marker
+    w.chart_1.add_event_marker = lambda x, *a, **k: got_x.append(x)
+    try:
+        w.broadcast_event("[BURNOUT]", "#FF9100", cur)      # 傳觸發幀
+        w.broadcast_event("[BURNOUT2]", "#FF9100")          # 不傳 → 用 latest
+    finally:
+        w.chart_1.add_event_marker = real_add
+    c.eq("★傳了觸發幀 → 標在該幀（100.5）", round(got_x[0], 3), 100.5)
+    c.eq("沒傳 → 沿用 latest_data（100.0），指令事件用這條", round(got_x[1], 3), 100.0)
+    c.check("★兩者差一個遙測週期，就是原本的偏差量",
+            abs((got_x[0] - got_x[1]) - 0.5) < 1e-9)
+
     return c.done()
 
 

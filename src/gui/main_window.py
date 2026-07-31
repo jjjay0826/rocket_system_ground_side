@@ -1116,10 +1116,25 @@ class MainWindow(QMainWindow):
         rest = re.sub(r"[^\w一-鿿]+", "", re.sub(r"\bch\d+\b", "", inner))
         return (rest[:5] or "EVT") + ch
 
-    def broadcast_event(self, label_text: str, color: str = "#D500F9"):
-        """在三張折線圖與 GPS 地圖上同步繪製事件標記線/卡片"""
-        if self.latest_data:
-            x_val = self.latest_data.gs_timestamp - self.start_time
+    def broadcast_event(self, label_text: str, color: str = "#D500F9",
+                        src_data=None):
+        """在三張折線圖與 GPS 地圖上同步繪製事件標記線/卡片。
+
+        src_data = 觸發這個事件的那一幀遙測。★由遙測推導出來的事件一定要傳，
+        操作員手打的指令不用（那時「現在」才是對的）。
+
+        ★2026-08-01：不傳的話會用 self.latest_data —— 而 update_ui 是在
+          【最後】才 self.latest_data = data，所有推導都跑在那之前。
+          結果是每一個事件標記都畫在【上一幀】，比觸發它的資料早整整
+          一個遙測週期（2Hz → 0.5 秒）。
+
+          畫面上看得很清楚：APOGEE 標在高度峰值左邊 0.5 秒，而開傘標記
+          反而落在峰值上。事後拿這些標記論證開傘時序時，每一個事件都
+          系統性早半秒 —— 而 C 備援的最小餘裕只有 1.69 秒。
+        """
+        d = src_data if src_data is not None else self.latest_data
+        if d is not None:
+            x_val = d.gs_timestamp - self.start_time
         else:
             x_val = time.time() - self.start_time
 
@@ -1136,8 +1151,7 @@ class MainWindow(QMainWindow):
         # 舊碼只檢查 location 是否為真值，而無定位時它是 (25.0, 121.5)
         # ——一個永遠為真的假座標。現在 models 會給 None，這個判斷就對了；
         # 但仍明確比對 gnss_state，免得日後有人又把預設值加回去。
-        d = self.latest_data
-        if d and d.location and getattr(d, "gnss_state", "") != "NO_FIX":
+        if d is not None and d.location and getattr(d, "gnss_state", "") != "NO_FIX":
             self.location_displayer.add_event_marker(d.location, full_label, color)
         elif d:
             # 不靜默跳過：事後對照事件與位置時，要知道這個事件本來就沒有座標
@@ -1297,7 +1311,7 @@ class MainWindow(QMainWindow):
         is_new_event, ev_name, ev_color = self.stage_display.update(
             data.stage, data.timestamp, getattr(data, "timestamp_ms", None))
         if is_new_event:
-            self.broadcast_event(f"[{ev_name}]", ev_color)
+            self.broadcast_event(f"[{ev_name}]", ev_color, data)
 
         # ── 地面站自行推導的事件（火箭端的 5 個狀態刻意不含這些）──────────
         # 資料本來就在遙測裡，推導出來標成「地面推導」與火箭回報視覺上分開。
@@ -1312,7 +1326,7 @@ class MainWindow(QMainWindow):
 
         def derive(name, color):
             if self.stage_display.mark_derived(name, data.timestamp, color, ms):
-                self.broadcast_event(f"[{name}]", color)
+                self.broadcast_event(f"[{name}]", color, data)
 
         if data.stage == 0:
             # IGNITION：推力起來的那一刻。★火箭自己看不到點火 —— 它的離架
