@@ -24,6 +24,22 @@ class LogDisplayer:
             "padding: 4px; "
             "}"
         )
+        # ★2026-07-31：限制文件區塊數。
+        #
+        # _append_log 直接 QTextEdit.append()，而 QTextDocument 預設【無上限】——
+        # 每一行都永久留在文件裡，記憶體與重繪成本一路長上去。
+        #
+        # 而這不是理論問題：communicator._process_data 對每一筆解析失敗的封包
+        # 都會印一行 "Format error"，2026-07-20 飛測記錄到封包碎裂率 38%。
+        #     2 Hz × 2 頻道 × 38% ≈ 每秒 1.5 行
+        #     發射台待命 3 小時 ≈ 16000 行
+        # 每行都是帶行內樣式的 HTML 區塊。QTextEdit 到那個量級就開始卡，
+        # 捲動延遲、視窗重繪掉格 —— 偏偏那正是需要它反應快的時候。
+        #
+        # 5000 行在 1.5 行/秒下是約 55 分鐘的回溯，遠超過任何一次要往回翻的
+        # 距離；而真正要查的完整紀錄在 raw log 與 CSV 裡，不靠這個視窗。
+        self.log_widget.document().setMaximumBlockCount(5000)
+
         self.emitter = LogSignalEmitter()
         self.emitter.log_received.connect(self._append_log)
         self.setup_logging()
