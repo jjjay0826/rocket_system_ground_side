@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import re
 import math
 
@@ -13,7 +13,7 @@ class SensorData:
     timestamp: datetime
     stage:int
     failedTasks:List[int]
-    location:Tuple[float, float]
+    location: Optional[Tuple[float, float]]   # None = 沒有定位（不要編座標）
     
     # 擴展新版航電遙測屬性，全部設置預設值以防向後相容報錯
     timestamp_ms: int = 0
@@ -66,11 +66,14 @@ class SensorData:
                 ts = ts or timestamp or datetime.now()
 
             # 建立包含基本欄位字典
-            location_val = data.get('location', [25.0, 121.5])
+            # ★2026-08-01：None 要能原樣穿過 ZMQ（後端 → JSON null → GUI）。
+            # 原本這裡對任何不合法的值都退回 (25.0, 121.5)，等於在
+            # 反序列化時又把假座標種回去 —— 上游擋得再乾淨也沒用。
+            location_val = data.get('location')
             if isinstance(location_val, (list, tuple)) and len(location_val) >= 2:
                 location = (float(location_val[0]), float(location_val[1]))
             else:
-                location = (25.0, 121.5)
+                location = None
 
             kwargs = {
                 "rotationRoll": float(data['rotationRoll']),
@@ -310,9 +313,18 @@ class SensorData:
         # 這種情況降級為 NO_FIX,讓地面站照「沒有定位」處理。
         if gnss_state == "FIX_3D" and (extracted['LAT'] is None or extracted['LON'] is None):
             gnss_state = "NO_FIX"
-        lat = float(extracted['LAT']) if extracted['LAT'] else 25.0
-        lon = float(extracted['LON']) if extracted['LON'] else 121.5
-        location = (lat, lon)
+        # ★2026-08-01：沒有定位就是 None，不要編一個座標出來。
+        # 舊碼填 (25.0, 121.5)＝台北。上面那段註解已經寫了它有多危險，
+        # 但只擋掉了「畫在地圖主標記上」這一條路；事件標記、CSV、
+        # 以及任何未來的消費端都照用那個假座標。實際發生過的事：
+        # 火箭在旭海的桌上、GPS 還沒定位，地圖上卻出現一個位在台北的
+        # [CMD] Reset Angle 標記。
+        # None 會讓所有 `if location:` 自然擋下，而且新寫的程式碼不可能
+        # 「不小心」把 None 當成合法座標用。
+        if extracted['LAT'] is None or extracted['LON'] is None:
+            location = None
+        else:
+            location = (float(extracted['LAT']), float(extracted['LON']))
 
         return cls(
             rotationRoll=rotationRoll,

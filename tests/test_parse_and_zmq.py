@@ -6,7 +6,7 @@
   ② GPS 宣稱定位但無座標 → 靜默套用台北座標，落海搜救時災難性誤導
   ③ 遙測與 log 共用一顆 PUB socket 卻沒鎖 → send_multipart 交錯，封包損毀
 """
-import sys, threading, inspect
+import sys, threading, inspect, json
 from _common import Checker, frame, REPO
 
 sys.path.insert(0, str(REPO))
@@ -76,6 +76,37 @@ def run():
     c.check("ZMQ bind 失敗有明確錯誤訊息（不是裸 traceback）",
             "zmq.error.ZMQError" in main_src and "ALREADY running" in main_src,
             "兩個 daemon 搶同一個 COM port 會讓遙測整段消失")
+
+    # ── ★2026-08-01 沒有定位就不可以編出一個座標 ────────────────────
+    # 實際發生過：火箭在旭海桌上、GPS 沒定位，地圖上卻出現一個位在
+    # 台北的 [CMD] Reset Angle 標記 —— 那是 models 在缺 LAT/LON 時
+    # 填的 (25.0, 121.5)。落海搜救時這種假座標是災難性的誤導。
+    from src.core.models import SensorData
+
+    nofix = SensorData.from_new_format(frame(t=1, sq=1).split(" LAT")[0])
+    c.eq("無定位 → gnss_state = NO_FIX", nofix.gnss_state, "NO_FIX")
+    c.check("★無定位 → location is None（不是台北）", nofix.location is None,
+            f"實際 {nofix.location!r}")
+    for ghost in ((25.0, 121.5), (23.5, 121.5)):
+        c.check(f"★不會產生假座標 {ghost}", nofix.location != ghost)
+
+    fix = SensorData.from_new_format(frame(t=1, sq=1))
+    c.check("有定位時照常回傳座標",
+            fix.location is not None and abs(fix.location[0] - 22.17485) < 1e-4,
+            f"{fix.location}")
+
+    # ZMQ 來回：None 必須原樣穿過 JSON（後端 → null → GUI）
+    for tag, d in (("無定位", nofix), ("有定位", fix)):
+        rt = SensorData.from_dict(json.loads(json.dumps(
+            {**d.to_dict(), "timestamp": d.timestamp.isoformat()})))
+        c.eq(f"★ZMQ 來回後 location 不變（{tag}）", rt.location, d.location)
+
+    # 事件標記那條路徑必須自己也擋一次（不能只靠 models）
+    mw_src = (REPO / "src" / "gui" / "main_window.py").read_text(encoding="utf-8")
+    i = mw_src.index("location_displayer.add_event_marker")
+    c.check("★事件標記有檢查 gnss_state，不是只看真值",
+            "NO_FIX" in mw_src[max(0, i - 400):i],
+            "只檢查 `if location:` 的話，任何人把預設值加回去就又破了")
 
     return c.done()
 

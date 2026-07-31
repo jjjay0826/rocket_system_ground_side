@@ -1104,8 +1104,16 @@ class MainWindow(QMainWindow):
         self.chart_2.add_event_marker(x_val, chart_label, color)
         self.chart_3.add_event_marker(x_val, chart_label, color)
 
-        if self.latest_data and self.latest_data.location:
-            self.location_displayer.add_event_marker(self.latest_data.location, full_label, color)
+        # ★2026-08-01：這裡是台北那個假標記的來源。
+        # 舊碼只檢查 location 是否為真值，而無定位時它是 (25.0, 121.5)
+        # ——一個永遠為真的假座標。現在 models 會給 None，這個判斷就對了；
+        # 但仍明確比對 gnss_state，免得日後有人又把預設值加回去。
+        d = self.latest_data
+        if d and d.location and getattr(d, "gnss_state", "") != "NO_FIX":
+            self.location_displayer.add_event_marker(d.location, full_label, color)
+        elif d:
+            # 不靜默跳過：事後對照事件與位置時，要知道這個事件本來就沒有座標
+            self.logger.info(f"[EVENT] {full_label} 無 GPS 定位，未在地圖上標記")
 
         self.logger.info(f"[EVENT BROADCAST] Marked event: {full_label}")
 
@@ -1115,8 +1123,10 @@ class MainWindow(QMainWindow):
         if data.gnss_state:
             has_fix = "FIX" in data.gnss_state.upper() and "NO_FIX" not in data.gnss_state.upper()
         else:
-            # 舊版 JSON 資料相容性檢查 (非預設值即視為有定位)
-            has_fix = data.location != (25.0, 121.5) and data.location != (23.5, 121.5)
+            # 舊版 JSON 相容：沒有 gnss_state 欄位時，有座標就當作有定位。
+            # ★2026-08-01：不再比對 (25.0,121.5)/(23.5,121.5) 這兩個魔術值
+            # —— models 已經不會產生它們了，留著只會讓人以為那還是有效的判斷。
+            has_fix = data.location is not None
 
         if has_fix:
             self.last_valid_location = data.location
