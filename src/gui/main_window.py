@@ -1067,6 +1067,52 @@ class MainWindow(QMainWindow):
         dot = max(-1.0, min(1.0, dot))
         return math.degrees(math.acos(dot))
 
+    # 圖上的事件縮寫。★用「關鍵字比對」而不是完全比對的對照表。
+    #
+    # 舊版是一張 10 筆的 dict，鍵是完整字串（"[CMD] ARM" 之類）。但事件標籤
+    # 現在有 23 個產生點，大多是帶 emoji 和頻道名的 f-string ——
+    # "[✅ ch1 DPL OK]"、"[🚫 ch2 REJECT]"、"[🔴 ch1 基準漂移 12m]"。
+    # 那些永遠對不中，全部掉進後備的「取 [] 內前 4 字」，於是圖上一整排
+    # 都是「emoji + ch」，彼此完全分不出來，而且看不出是哪一塊板。
+    #
+    # 依序比對、先中先贏。順序有意義：GNDTEST OFF 必須排在 GNDTEST 前面。
+    _ABBR_RULES = [
+        ("Reset Angle", "RST"),  ("SETCH", "SETCH"), ("CAL", "CAL"),
+        ("GNDTEST OFF", "GND-"), ("GNDTEST", "GND+"),
+        ("軸向", "AXIS"),        ("上升中", "!ASC"),
+        ("基準漂移", "DRIFT"),   ("未確認", "!ACK"),
+        ("保險絲熔斷", "FUSE"),  ("電量危險", "BATT"),
+        ("已武裝", "ARMD"),      ("ARMED", "ARM"),
+        ("REJECT", "REJ"),
+        ("PARACHUTE_DEPLOY", "DPL"), ("DPL", "DPL"), ("ARM", "ARM"),
+        ("BURNOUT", "BRN"),      ("APOGEE", "APG"),
+        ("TOUCHDOWN", "TDN"),    ("LAUNCH", "LNCH"),
+        ("DESCENT", "DESC"),     ("LANDED", "LAND"),
+        ("MSG", "MSG"),
+    ]
+
+    def _chart_abbr(self, label_text: str) -> str:
+        """事件標籤 → 圖表上的短縮寫（含頻道號，才分得出是哪塊板）"""
+        inner = label_text
+        m = re.search(r"\[([^\]]+)\]", label_text)
+        if m:
+            # "[CMD] DPL" 這種：[] 之後還有內容，要一起看
+            inner = (m.group(1) + " " + label_text[m.end():]).strip()
+        ch = ""
+        mc = re.search(r"\bch(\d+)", inner)
+        if mc:
+            ch = mc.group(1)
+        ok = "✓" if "OK" in inner else ""
+        for key, abbr in self._ABBR_RULES:
+            if key in inner:
+                if abbr == "SETCH":
+                    mn = re.search(r"SETCH\s*(\d+)", inner)
+                    return f"CH{mn.group(1)}" if mn else "SETCH"
+                return f"{abbr}{ok}{ch}"
+        # 真的認不出來：去掉 emoji 與頻道名再截斷，至少留下可讀的字
+        rest = re.sub(r"[^\w一-鿿]+", "", re.sub(r"\bch\d+\b", "", inner))
+        return (rest[:5] or "EVT") + ch
+
     def broadcast_event(self, label_text: str, color: str = "#D500F9"):
         """在三張折線圖與 GPS 地圖上同步繪製事件標記線/卡片"""
         if self.latest_data:
@@ -1077,28 +1123,7 @@ class MainWindow(QMainWindow):
         time_str = datetime.now().strftime("%H:%M:%S")
         full_label = f"[{time_str}] {label_text}"
 
-        # 縮寫映射表：圖表只顯示簡短縮寫，不顯示時間戳
-        _ABBR_MAP = {
-            "[CMD] ARM":          "ARM",
-            "[CMD] DPL":          "DPL",
-            "[CMD] ABG":          "ABG",
-            "[CMD] Reset Angle":  "RST",
-            "[IGNITION]":         "IGN",
-            "[BURNOUT]":          "BRN",
-            "[APOGEE]":           "APG",
-            "[PARACHUTE_DEPLOY]": "DPL",
-            "[TOUCHDOWN]":        "TDN",
-            "[AIRBAG_DEPLOY]":    "ABG",
-        }
-        # 找縮寫；MSG 類型取 MSG 前綴；否則截取 [] 內容最多 4 字
-        chart_label = _ABBR_MAP.get(label_text)
-        if chart_label is None:
-            if label_text.startswith("[MSG]"):
-                chart_label = "MSG"
-            else:
-                # 通用後備：取第一個 [] 內的縮寫（最多 4 個字元）
-                m = re.search(r'\[([^\]]+)\]', label_text)
-                chart_label = m.group(1)[:4] if m else label_text[:4]
+        chart_label = self._chart_abbr(label_text)
 
         self.chart_1.add_event_marker(x_val, chart_label, color)
         self.chart_2.add_event_marker(x_val, chart_label, color)
