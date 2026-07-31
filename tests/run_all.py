@@ -28,6 +28,7 @@ SUITES = [
     ("link",      "test_link_battery.py",       False),
     ("sentinel",  "test_sentinel_poisoning.py", False),  # 2026-07-30 已修，見檔案開頭
     ("axis",      "test_axis_mapping.py",       False),  # 2026-07-31 航電板改豎放
+    ("csv",       "test_csv_storage.py",        False),  # 2026-08-01 遙測落盤
 ]
 
 
