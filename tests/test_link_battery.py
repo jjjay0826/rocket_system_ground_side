@@ -72,14 +72,30 @@ def run():
     h = Grab()
     logging.getLogger().addHandler(h)
     try:
+        # ★2026-08-01：電量分級告警【已停用】—— 分壓電路沒焊，VF 是浮接雜訊
+        # （趴在 0~0.5V），會讓「電量危險」和「🔴熔斷」兩條門檻永久成立。
+        # 一個永遠為真的紅色告警，會順便把其他告警一起訓練成雜訊 ——
+        # 真的熔斷（傘開不了）發生時，畫面看起來和平常一模一樣。
+        # 所以這裡驗的是【它不出聲】，而不是它出聲。
+        # 焊好後把 _track_pyro_power 的 `if False:` 改回 `if lvl != "na":`，
+        # 並把這幾條斷言改回原本的正向版本。
         w._track_pyro_power("ch1", SensorData.from_new_format(frame(t=1, sq=1, vf=8.2)))
         w._track_pyro_power("ch1", SensorData.from_new_format(frame(t=2, sq=2, vf=6.9)))
-        c.check("★跌破 7.0V 觸發「電量偏低」", any("電量偏低" in x for x in hits))
+        c.check("★跌破 7.0V 不再告警（功能已停用）",
+                not any("電量偏低" in x for x in hits))
         w._track_pyro_power("ch1", SensorData.from_new_format(frame(t=3, sq=3, vf=6.4)))
-        c.check("★跌破 6.6V 觸發「電量危險」", any("電量危險" in x for x in hits))
-        n = len(hits)
-        w._track_pyro_power("ch1", SensorData.from_new_format(frame(t=4, sq=4, vf=6.4)))
-        c.check("同一等級不重複洗版", len(hits) == n)
+        c.check("★跌破 6.6V 不再告警（功能已停用）",
+                not any("電量危險" in x for x in hits))
+        w._track_pyro_power("ch1", SensorData.from_new_format(frame(t=4, sq=4, vf=0.05)))
+        c.check("★浮接雜訊 0.05V 也不會吼「熔斷」",
+                not any("熔斷" in x for x in hits),
+                "分壓沒焊時 VF 就長這樣；這正是停用的理由")
+        # 但讀值本身仍要照收 —— 焊好後只要把 if False 改掉就會恢復
+        c.check("電壓讀值仍持續收集（ch_pyro_volt 有更新）",
+                "ch1" in w.ch_pyro_volt and abs(w.ch_pyro_volt["ch1"][0] - 0.05) < 1e-6,
+                f"{w.ch_pyro_volt.get('ch1')}")
+        c.check("_batt_level 本身仍可用（分級邏輯沒被刪掉）",
+                w._batt_level(6.4) == "crit" and w._batt_level(8.2) == "ok")
     finally:
         logging.getLogger().removeHandler(h)
 

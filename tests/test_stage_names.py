@@ -47,8 +47,31 @@ def run():
             str(EVENT_STAGES.get(2)))
 
     # ── T0 必須是離架，不是開傘 ──
-    c.eq("T0 錨定在 LAUNCHED", T0_STAGE, 1)
-    c.eq("T0 對應的名稱", ROCKET_STAGES[T0_STAGE], "LAUNCHED")
+    # ★2026-08-01：畫面改回完整飛行序列（11 列），T0_STAGE 現在是【序列列號】
+    #   而不是 ST 值。所以驗的是「那一列真的叫 LAUNCHED」，不是它等於 1。
+    from src.gui.visualizers.stage_display import FLIGHT_SEQUENCE, ST_ROW
+    c.eq("T0 對應的名稱", FLIGHT_SEQUENCE[T0_STAGE][0], "LAUNCHED")
+    c.eq("T0 就是 ST:1 對應的那一列", T0_STAGE, ST_ROW[1])
+
+    # ── 完整飛行序列：火箭列與推導列 ────────────────────────────────
+    rkt = [n for n, _, s in FLIGHT_SEQUENCE if s == "rkt"]
+    gnd = [n for n, _, s in FLIGHT_SEQUENCE if s == "gnd"]
+    c.eq("★序列裡的火箭列＝FlightState_t 逐字相同", rkt, expect,
+         "畫面寫 PARACHUTE_DEPLOY、原始碼叫 DEPLOYING，事後對照的人會 grep 不到")
+    c.check("★每個 ST 值都有對應的列，且不重複",
+            sorted(ST_ROW) == [0, 1, 2, 3, 4]
+            and len(set(ST_ROW.values())) == 5,
+            f"{ST_ROW}")
+    c.check("★ST_ROW 的對應列真的是火箭列",
+            all(FLIGHT_SEQUENCE[r][2] == "rkt" for r in ST_ROW.values()))
+    c.check("★ST 值遞增，對應的列號也遞增（時間軸不會倒退）",
+            [ST_ROW[k] for k in sorted(ST_ROW)] == sorted(ST_ROW.values()))
+    c.check("推導列都在火箭列之間，不是附在最後",
+            gnd and FLIGHT_SEQUENCE[0][2] == "rkt"
+            and FLIGHT_SEQUENCE[-1][2] == "rkt",
+            f"推導列 {gnd}")
+    c.check("氣囊已從序列移除（2026-07-31）",
+            not any("AIRBAG" in n for n, _, _ in FLIGHT_SEQUENCE))
 
     # ── 實跑一遍完整飛行，確認時間軸與越界處理 ──
     from PyQt6.QtWidgets import QListWidget
@@ -58,29 +81,44 @@ def run():
     t0 = datetime(2026, 7, 30, 10, 0, 0)
     for st, dt in ((0, 0), (1, 1.3), (2, 18.0), (3, 19.0), (4, 220.0)):
         sd.update(st, t0 + timedelta(seconds=dt))
-    c.eq("走完 0→4 目前停在 LANDED", sd.current_stage, 4)
-    c.eq("五個狀態都造訪過", sorted(sd.visited_stages), [0, 1, 2, 3, 4])
-    rel = (sd.stage_times[2] - sd.stage_times[T0_STAGE]).total_seconds()
+    c.eq("走完 0→4 目前停在 LANDED", sd.current_row, ST_ROW[4])
+    c.eq("五個火箭狀態都造訪過", sorted(sd.visited_rows),
+         sorted(ST_ROW.values()))
+    rel = (sd.row_times[ST_ROW[2]] - sd.row_times[T0_STAGE]).total_seconds()
     c.check("開傘時間相對離架而非相對開傘", abs(rel - 16.7) < 1e-6,
             f"T+{rel:.2f}s（若 T0 錯錨在開傘，這裡會是 0.00）")
+    c.eq("★畫面列數＝完整飛行序列（不是只有 5 列）",
+         len(sd._labels()), len(FLIGHT_SEQUENCE))
 
     sd.reset()
     sd.update(9, t0)          # 越界：韌體真的改成 12 態時的行為
     c.check("越界的 ST 不會 IndexError，也不會畫出錯誤名稱",
-            sd.current_stage == -1, "舊碼會直接 self.stages[9] 爆掉")
+            sd.current_row == -1, "舊碼會直接 self.stages[9] 爆掉")
 
-    # ── 推導事件與火箭回報要分得開 ──
+    # ── 推導事件要點亮序列裡對應的那一列 ──
     sd.reset()
     sd.update(1, t0)
     c.check("推導事件可加入", sd.mark_derived("BURNOUT", t0 + timedelta(seconds=5.9)))
     c.check("同名推導事件不重複", not sd.mark_derived("BURNOUT", t0))
-    c.eq("推導事件不混進火箭狀態清單", len(sd.stages), 5)
+    burn_row = next(i for i, (n, _, _) in enumerate(FLIGHT_SEQUENCE) if n == "BURNOUT")
+    c.check("★BURNOUT 點亮的是序列裡 BURNOUT 那一列", burn_row in sd.derived_rows,
+            f"derived_rows={sd.derived_rows}")
+    c.check("★帶後綴也對得上（APOGEE 1040m → APOGEE 列）",
+            sd.mark_derived("APOGEE 1040m", t0 + timedelta(seconds=16))
+            and next(i for i, (n, _, _) in enumerate(FLIGHT_SEQUENCE)
+                     if n == "APOGEE") in sd.derived_rows)
     labels = sd._labels()
-    c.check("推導事件標示為「地面推導」",
-            any("地面推導" in x for x in labels),
+    c.check("推導列標示為「推導」，未推導的標「—」",
+            any("推導" in x for x in labels) and any("—" in x for x in labels),
             "免得日後有人把推導值當成火箭實測回報")
+    c.check("序列外的推導事件仍可附在最後",
+            sd.mark_derived("SOMETHING_ELSE", t0) and len(sd.extra) == 1)
     sd.reset()
-    c.eq("reset 清掉推導事件", sd.derived, [])
+    c.check("reset 清掉推導事件與時間軸",
+            not sd.derived_rows and not sd.extra and not sd.row_times
+            and not sd.visited_rows and sd.current_row == -1)
+    c.eq("reset 之後畫面仍是完整序列（不是空的）",
+         len(sd._labels()), len(FLIGHT_SEQUENCE))
 
     return c.done()
 

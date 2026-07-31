@@ -55,54 +55,11 @@ class LocationDisplayer:
                     cursor: default !important;
                     text-decoration: none !important;
                 }}
-                /* ★座標疊層：不依賴 Leaflet，地圖掛掉時它就是唯一的資訊 */
-                #coord {{
-                    position: fixed; left: 0; top: 0; z-index: 9999;
-                    background: rgba(0,0,0,.78); color: #fff;
-                    font: 700 15px/1.45 Consolas, "Courier New", monospace;
-                    padding: 6px 10px; pointer-events: none;
-                    border-bottom-right-radius: 6px; white-space: pre;
-                }}
-                #coord .t {{ color:#FF9500; font-size:12px; font-weight:400; }}
-                #offline {{
-                    display: none; position: fixed; inset: 0; z-index: 9998;
-                    background: #1a1a1a; color: #fff; padding: 24px;
-                    font: 400 14px/1.7 Consolas, "Courier New", monospace;
-                }}
-                #offline b {{ color:#FF3B30; font-size:18px; }}
-                #offline .big {{ font-size: 30px; font-weight: 700; color:#00E676;
-                                 letter-spacing: 1px; margin: 14px 0; }}
             </style>
         </head>
         <body>
             <div id="map"></div>
-            <div id="coord">等待 GPS…</div>
-            <div id="offline">
-              <b>⚠ 地圖無法載入</b>（需要網際網路：unpkg.com 的 Leaflet + OSM 圖磚）<br>
-              座標仍然正常更新，見下方與左上角。飛行資料完全不受影響。
-              <div class="big" id="offbig">等待 GPS…</div>
-              <div id="offlist" style="opacity:.75;font-size:12px;"></div>
-            </div>
             <script>
-            // ── 座標疊層：與 Leaflet 完全無關，先定義，確保它一定存在 ──
-            var _pts = [];
-            function _showCoord(lat, lng, timeStr) {{
-                var t = timeStr ? '<span class="t">[' + timeStr + ']</span>\n' : '';
-                var txt = lat.toFixed(6) + ', ' + lng.toFixed(6);
-                document.getElementById('coord').innerHTML = t + txt;
-                var ob = document.getElementById('offbig');
-                if (ob) ob.textContent = txt;
-                _pts.push((timeStr || '') + ' ' + txt);
-                if (_pts.length > 12) _pts.shift();
-                var ol = document.getElementById('offlist');
-                if (ol) ol.textContent = _pts.slice().reverse().join('\n');
-            }}
-            // Leaflet 沒載進來 → 走純文字模式，並且【大聲說出來】
-            if (typeof L === 'undefined') {{
-                document.getElementById('offline').style.display = 'block';
-                window.updateMarker  = function(lat, lng, follow, timeStr) {{ _showCoord(lat, lng, timeStr); }};
-                window.addEventMarker = function() {{}};
-            }} else {{
                 // 初始中心點設在台灣 (縮放等級為 7，顯示全島概覽，無標記與軌跡)
                 var map = L.map('map', {{ attributionControl: true }}).setView([{lat}, {lng}], 7);
                 if (map.attributionControl) {{
@@ -156,7 +113,6 @@ class LocationDisplayer:
                         fillOpacity: 0.7,
                         weight: 1
                     }}).bindTooltip(pointTooltip, {{ sticky: true }}).addTo(map);
-                    _showCoord(lat, lng, timeStr);   /* 地圖正常時疊層照樣更新 */
                 }}
 
                 function addEventMarker(lat, lng, labelText, color) {{
@@ -171,7 +127,6 @@ class LocationDisplayer:
                     }}).bindPopup("<b>" + labelText + "</b>").addTo(map);
                     eventMarkers.push(m);
                 }}
-            }}   /* ← 對應上方 if (typeof L === 'undefined') 的 else */
             </script>
         </body>
         </html>
@@ -194,11 +149,7 @@ class LocationDisplayer:
             if self.map_initialized:
                 lat, lng = location
                 follow_js = "true" if follow else "false"
-                # 與 add_event_marker 一樣做轉義：time_str 目前是遙測來的
-                # HH:MM:SS，但它是【外部輸入】，不該直接內插進 JS 字串。
-                safe_t = (time_str.replace("\\", "\\\\")
-                                  .replace("'", "\\'").replace("\n", ""))
-                time_js = f"'{safe_t}'" if time_str else "''"
+                time_js = f"'{time_str}'" if time_str else "''"
                 js_code = f"if (typeof updateMarker === 'function') {{ updateMarker({lat}, {lng}, {follow_js}, {time_js}); }}"
                 self.web_view.page().runJavaScript(js_code)
             else:
@@ -215,4 +166,4 @@ class LocationDisplayer:
 
     def reset(self, initial_location: Tuple[float, float] = (23.5, 121.5)):
         """重置地圖與歷史軌跡線標記"""
-        self.create_map(initial_location)
+        self.create_map(initial_location)

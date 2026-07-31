@@ -810,29 +810,50 @@ class MainWindow(QMainWindow):
                 else:
                     self.logger.error(f"Usage: /focus <{' | '.join(self.channel_ids)}>")
             elif cmd == "/help":
-                help_msg = (
-                    "Available terminal commands (must start with '/'):\n"
-                    "  /port <PORT>      - Switch serial port (e.g. /port COM4)\n"
-                    "  /baud <BAUDRATE>  - Switch baudrate (e.g. /baud 115200)\n"
-                    "  /connect          - Start/Reconnect serial communication\n"
-                    "  /disconnect       - Stop serial communication\n"
-                    "  /reset-angle      - Reset IMU angle deviation\n"
-                    "  /reset-data       - Reset session data (archive old CSV/raw log, start new file & reset UI)\n"
-                    "  /arm              - Remote Safety ARM (focus board, 30s window)\n"
-                    "  /dpl              - Emergency Force Parachute Deploy (focus board)\n"
-                    "  /arm_all          - ARM ALL boards at once (ch1+ch2 hot-standby)\n"
-                    "  /dpl_all          - Force Parachute Deploy on ALL boards at once\n"
-                    "  /gndtest [off]    - Ground-test mode on focus board (unlocks PB6 manual fire, 10min auto-expiry)\n"
-                    "  /axis [dir|auto]  - Show/set IMU mounting axis (+z|+x|+y|-z|-x|-y); auto-detects on pad\n"
-                    "  /cal              - Rocket baro re-zero + ground angle reset (focus board, IDLE only)\n"
-                    "  /cal_all          - Rocket baro re-zero on ALL boards + ground angle reset\n"
-                    "  /setch <0-80>     - Change rocket LoRa channel (850.125+ch MHz, IDLE only;\n"
-                    "                      ground dongle MUST be changed to match or board is lost)\n"
-                    "  /focus <ch>       - Switch GUI focus channel (charts/map/stage re-render)\n"
-                    "Status extras: 黃燈=Format Error(資料流入但解析全失敗);"
-                    "簡版狀態列 🔓ARMxx s=該板火箭回讀的解鎖倒數;"
-                    "pyro 指令 10s 未見下行確認(MSG/stage)會 LOUD 告警"
-                )
+                # 指令依【性質】分組，不是依字母。緊急時要找的是「開傘」，
+                # 不是「以 d 開頭的那個」。🔴 標的是會點火工品的。
+                help_msg = "\n".join([
+                    "指令一覽（全部以 / 開頭）",
+                    "",
+                    "🔴 火工品 —— 會真的點火，動作前確認目標板",
+                    "   /arm              解鎖焦點板（30 秒窗口）",
+                    "   /arm_all          解鎖【全部】板（雙板熱備援）",
+                    "   /dpl              強制開傘 · 焦點板",
+                    "   /dpl_all          強制開傘 · 【全部】板",
+                    "                     上升中（stage=1 且 vz>2）會要求再輸入一次",
+                    "",
+                    "🧪 地面測試",
+                    "   /gndtest          開啟地面測試模式（10 分鐘後自動失效）",
+                    "                     解除 PB6 手動發火閘門；PB6 仍需 IDLE + ARM",
+                    "   /gndtest off      立刻關閉，不必等逾時",
+                    "",
+                    "🎯 校準 —— 只在 IDLE 受理，飛行中火箭會拒收",
+                    "   /cal              氣壓零點重校 · 焦點板 ＋ 地面姿態歸零",
+                    "   /cal_all          氣壓零點重校 · 【全部】板 ＋ 地面姿態歸零",
+                    "   /reset-angle      只歸零地面端的姿態偏角（不送指令給火箭）",
+                    "   /axis [dir]       IMU 安裝軸向 +z|+x|+y|-z|-x|-y（預設 -x＝豎放）",
+                    "",
+                    "📻 連線",
+                    "   /port <PORT>      切換序列埠，例：/port COM4",
+                    "   /baud <RATE>      切換鮑率，例：/baud 9600",
+                    "   /connect          連線／重新連線",
+                    "   /disconnect       中斷連線",
+                    "   /setch <0-80>     換火箭 LoRa 頻道（850.125+ch MHz，IDLE 限定）",
+                    "                     ⚠ 火箭換完，地面 dongle 也要換，否則該板立刻失聯",
+                    "                     ⚠ 台灣 LP0002 只准 CH70~74（920.125~924.125 MHz）",
+                    "",
+                    "🖥 介面／資料",
+                    "   /focus <ch>       切換焦點頻道（圖表／地圖／階段跟著重畫）",
+                    "   /reset-data       封存目前的 CSV 與 raw log，開新檔並清空畫面",
+                    "   /help             這張表",
+                    "",
+                    "讀畫面",
+                    "   黃燈              有資料流入但解析全失敗（格式不符）",
+                    "   🔓ARMxx s         火箭回讀的解鎖倒數（不是地面端自己算的）",
+                    "   火工品指令        送出後 10 秒內沒看到下行確認會大聲告警",
+                    "   階段列 灰色「—」   該列是地面推導、目前還沒推導出來",
+                    "   階段列 紅底        火箭列被跳過＝那段遙測整段掉包",
+                ])
                 self.logger.info(help_msg)
             else:
                 self.logger.error(f"Unknown terminal command: {cmd}")
@@ -1490,8 +1511,11 @@ class MainWindow(QMainWindow):
             if ch == self.focus_channel:
                 text = "▶" + text
             # pyro 電源狀態(10s 內的量測才顯示,過期不留舊值誤導)
+            # ★2026-08-01：分壓電路沒焊，VF/VA 是浮接雜訊（見 _track_pyro_power）。
+            #   保留讀值收集（ch_pyro_volt 仍會更新，焊好後只要把 if False 改掉），
+            #   但不再顯示 —— 永遠掛著的「🔴熔斷」會讓真的熔斷看不出來。
             pv = self.ch_pyro_volt.get(ch)
-            if pv and time.time() - pv[2] < 10.0:
+            if False and pv and time.time() - pv[2] < 10.0:   # ← 焊好後移除 False and
                 vf, va = pv[0], pv[1]
                 if 0 <= vf < self._PYRO_LIVE_V:
                     text += " 🔴熔斷"
@@ -1755,11 +1779,34 @@ class MainWindow(QMainWindow):
         blown = (0 <= vf < self._PYRO_LIVE_V)
         armed = (va >= self._PYRO_LIVE_V)
 
-        # ── 電量分級警告(只在「變差」時出聲,回升不吵)──────────────
-        # ★這段必須放在下面的 early return 之前:舊版把它擺在後面,
-        #   只有 blown/armed 翻轉時才會走到 → 低電量警告等同死碼。
+        # ═══════════════════════════════════════════════════════════
+        # ★2026-08-01 電量分級告警【整段停用】—— 分壓電路沒有焊。
+        #
+        # 【不停用會怎樣】
+        #   VF/VA 是 ADC 讀分壓後的電壓。分壓電路沒焊上去的話，那支腳是
+        #   浮接的，ADC 讀到的是雜訊 —— 通常趴在 0 附近，偶爾被鄰腳耦合
+        #   跳幾百 mV。換算出來的 VF 大約是 0.0~0.5V。
+        #
+        #   而判讀門檻是：
+        #       VF < 6.6V  → 「電量危險，不應繼續飛行，立即更換電池」（紅色）
+        #       VF < 1.0V  → 「保險絲熔斷」（_PYRO_LIVE_V，狀態列顯示 🔴熔斷）
+        #
+        #   兩條都會【永久成立】。後果不是「多幾行紅字」，而是：
+        #     · 發射倒數時畫面上一直掛著紅色「電量危險」和「🔴熔斷」
+        #     · 操作員在最需要相信畫面的時候，學會忽略紅色告警
+        #     · 真的熔斷（誤觸發、電流走 safety shunt 燒斷保險絲 → 傘開不了）
+        #       發生時，畫面看起來和現在一模一樣，沒有人會注意到
+        #
+        #   一個永遠為真的告警，比沒有告警更糟 —— 它會順便把其他告警一起
+        #   訓練成雜訊。所以整段關掉，而不是留著讓它吼。
+        #
+        # 【焊上去之後怎麼恢復】
+        #   把下面 if False: 改回 if lvl != "na":，並移除本註解區塊。
+        #   門檻在 _PYRO_LOW_V / _PYRO_CRIT_V（7.0V / 6.6V，2S 鋰電）。
+        #   狀態列的電量圖示（🔋/🪫）另外在 _refresh_channel_labels 停用。
+        # ═══════════════════════════════════════════════════════════
         lvl = self._batt_level(vf)
-        if lvl != "na":
+        if False:   # ← 分壓電路焊好後改回 lvl != "na"
             prev_lvl = self._prev_batt_level.get(ch)
             if prev_lvl != lvl:
                 self._prev_batt_level[ch] = lvl
