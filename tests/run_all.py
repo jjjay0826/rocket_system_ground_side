@@ -32,6 +32,7 @@ SUITES = [
     ("labels",    "test_chart_labels.py",       False),  # 2026-08-01 圖表事件縮寫
     ("hideretry", "test_hide_retry.py",         False),  # 2026-08-01 折疊 vs 靜音
     ("placehold", "test_no_placeholder.py",     False),  # 2026-08-01 TextLabel 預留字
+    ("ignition",  "test_ignition.py",           False),  # 2026-08-01 IGNITION 離架後才定案
 ]
 
 

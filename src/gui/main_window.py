@@ -37,6 +37,8 @@ class MainWindow(QMainWindow):
         self.max_height = 0.0
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
+        self._ign_cand = None      # 推導 IGNITION 用：離架確認前不定案
+        self._ign_above = False
         self.calib_q = None
         
         # ─── 快速軸向對應設定區 (Sensor Axis Mapping Configuration) ───
@@ -526,6 +528,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'log_display') and self.log_display:
             self.log_display.set_hide_port_errors(checked)
 
+    _IGN_GA_THR = 1.5        # 推力起來的門檻（g）
+    _IGN_MAX_LEAD_S = 5.0    # 點火→離架偵測的合理上限；超過不採信候選
+
     def _hide_retry_flight_guard(self, data):
         """★2026-08-01：一離架就強制解除折疊。
 
@@ -683,6 +688,8 @@ class MainWindow(QMainWindow):
         self.max_height = 0.0
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
+        self._ign_cand = None      # 推導 IGNITION 用：離架確認前不定案
+        self._ign_above = False
         self.ui.gl_label.setText(
             "當前偏角: 0.0° | 最大偏角: 0.0°"
         )
@@ -950,6 +957,8 @@ class MainWindow(QMainWindow):
         self.max_height = 0.0
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
+        self._ign_cand = None      # 推導 IGNITION 用：離架確認前不定案
+        self._ign_above = False
         self.calib_q = None
         self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])
         
@@ -1405,13 +1414,40 @@ class MainWindow(QMainWindow):
                 self.broadcast_event(f"[{name}]", color, data)
 
         if data.stage == 0:
-            # IGNITION：推力起來的那一刻。★火箭自己看不到點火 —— 它的離架
-            # 偵測要 2.5g 持續 200ms，那時已經是點火後約 1.3 秒。但遙測在
-            # ST 還是 0 的時候就一直在送，地面站看得到 GA 先爬起來。
-            # 所以這是【量到的】，不是拿常數回推的。
-            if not math.isnan(ga) and ga > 1.5:
-                derive("IGNITION", "#00E676")
+            # IGNITION 的【候選】—— ★不在這裡定案。
+            #
+            # 舊碼是「ST:0 期間第一個 GA>1.5 就標 IGNITION」，那是錯的：
+            # ST:0 是整段發射台待命時間，搬上架、放下、有人撞到、陣風，
+            # 任何一次超過 1.5g 都會標下去。而 mark_derived 是一次性的 ——
+            # 誤標之後【真正的點火再也蓋不掉】。
+            #
+            # 改成：記住最後一次「由下往上穿過門檻」的時刻，一直覆寫；
+            # 等 ST 真的變成 1（火箭自己確認離架）才把它定案。
+            # 推力段 GA 會持續在門檻之上，所以離架前的最後一個上升沿
+            # 就是點火。搬動造成的尖峰會被後來真正的點火覆寫掉。
+            if not math.isnan(ga):
+                if ga >= self._IGN_GA_THR and not self._ign_above:
+                    self._ign_cand = (data.timestamp, ms)   # 上升沿
+                    self._ign_above = True
+                elif ga < self._IGN_GA_THR:
+                    self._ign_above = False
         elif data.stage == 1:
+            # ★離架確認了 —— 現在才把點火候選定案。
+            # 距離太遠的候選不採信：點火到「2.5g 持續 200ms」約 1.3 秒，
+            # 給到 5 秒已經很寬。超過就是搬動留下的舊尖峰，或真正的
+            # 上升沿掉包了 —— 那時寧可讓 IGNITION 維持「—」，
+            # 也不要標一個編出來的時間。
+            if self._ign_cand is not None:
+                c_ts, c_ms = self._ign_cand
+                if c_ms and ms:
+                    lead = (ms - c_ms) / 1000.0
+                else:
+                    lead = (data.timestamp - c_ts).total_seconds()
+                if 0 <= lead <= self._IGN_MAX_LEAD_S:
+                    if self.stage_display.mark_derived("IGNITION", c_ts,
+                                                       "#00E676", c_ms):
+                        self.broadcast_event("[IGNITION]", "#00E676", data)
+                self._ign_cand = None
             # BURNOUT：合加速度跌回 1.15g 以下 = 推力結束（與韌體同一門檻）
             if not math.isnan(ga) and ga < 1.15 and getattr(self, "_seen_boost", False):
                 derive("BURNOUT", "#FF9100")
