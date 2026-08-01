@@ -35,6 +35,8 @@ class MainWindow(QMainWindow):
         self.max_total_accel = 0.0
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
+        self._kh_prev = None   # KH 突波過濾：三點中位數用
+        self._kh_prev2 = None
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
         self._ign_cand = None      # 推導 IGNITION 用：離架確認前不定案
@@ -528,6 +530,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'log_display') and self.log_display:
             self.log_display.set_hide_port_errors(checked)
 
+    _KH_SPIKE_M = 8.0        # KH 比【前後兩包都】高出這麼多 = 孤立突波
+                             # 真實頂點附近 0.5s 只變 1.2m，不會誤判
     _IGN_GA_THR = 1.5        # 推力起來的門檻（g）
     _IGN_MAX_LEAD_S = 5.0    # 點火→離架偵測的合理上限；超過不採信候選
 
@@ -686,6 +690,8 @@ class MainWindow(QMainWindow):
         self.max_deviation_angle = 0.0
         self.max_total_accel = 0.0
         self.max_height = 0.0
+        self._kh_prev = None   # KH 突波過濾：三點中位數用
+        self._kh_prev2 = None
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
         self._ign_cand = None      # 推導 IGNITION 用：離架確認前不定案
@@ -955,6 +961,8 @@ class MainWindow(QMainWindow):
         self.max_total_accel = 0.0
         self.max_deviation_angle = 0.0
         self.max_height = 0.0
+        self._kh_prev = None   # KH 突波過濾：三點中位數用
+        self._kh_prev2 = None
         self._seen_boost = False   # 推導 BURNOUT 用：確定看過推力段才算數
         self._seen_descent = False # 推導 TOUCHDOWN 用：確定看過下降段才算數
         self._ign_cand = None      # 推導 IGNITION 用：離架確認前不定案
@@ -1366,7 +1374,42 @@ class MainWindow(QMainWindow):
             self.calib_q = self.quaternion
 
         self.max_total_accel = max(self.max_total_accel, data.total_accel)
-        self.max_height = max(self.max_height, data.kfh_height)
+
+        # ★2026-08-01：max_height 擋掉單包突波（三點中位數式）。
+        #
+        # 實測會出現【單包 KH 比鄰近值高 10m 以上】的突波。原本是
+        #     self.max_height = max(self.max_height, data.kfh_height)
+        # 一包就把頂點永久灌高 —— 而那個值會進 APOGEE 標籤、進畫面，
+        # 也是報告書上要交的頂點高度。
+        #
+        # 判準是【比前後兩包都高出 _KH_SPIKE_M】= 孤立高點。
+        #   真實爬升：單調上升，永遠不會比後一包高 → 不受影響
+        #   真實頂點：自由落體在頂點附近 0.5s 只變 1.2m → 遠低於門檻
+        #   突波：比前後都高 10m 以上 → 擋掉
+        # 代價是 max_height 落後一包（0.5s），頂點附近高度幾乎不變，看不出來。
+        #
+        # ⚠ 第一版寫成「要連續兩包背書、取 min」是錯的 —— 真實爬升時每兩包
+        #   只採信較舊的那一個，130 m/s 上升會少報上百公尺，比突波還糟。
+        #
+        # ⚠ 韌體端沒有對應保護：rel_alt 完全沒有突波抑制，peak_rel_alt 直接
+        #   吃 `if (rel_alt > peak) peak = rel_alt`。開傘受的影響見
+        #   doc/open_defects_20260801.md。這裡只擋住【顯示與報告】。
+        kh = data.kfh_height
+        if self._kh_prev is not None:
+            pv = self._kh_prev
+            is_spike = (self._kh_prev2 is not None
+                        and pv - self._kh_prev2 > self._KH_SPIKE_M
+                        and pv - kh > self._KH_SPIKE_M)
+            if is_spike:
+                self.logger.warning(
+                    f"⚠ KH 單包突波 {pv:.1f}m（前後 {self._kh_prev2:.1f} / "
+                    f"{kh:.1f}m）—— 未計入最大高度。氣壓突波也會重置開傘"
+                    f"條件 B 的 1.5 秒計時，見 open_defects_20260801.md")
+            else:
+                self.max_height = max(self.max_height, pv)
+        self._kh_prev2 = self._kh_prev
+        self._kh_prev = kh
+
         current_dev = self.get_deviation_angle(self.quaternion, self.calib_q)
         self.max_deviation_angle = max(self.max_deviation_angle, current_dev)
 
