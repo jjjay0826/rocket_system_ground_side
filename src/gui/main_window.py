@@ -218,7 +218,9 @@ class MainWindow(QMainWindow):
         
         self.location_displayer = LocationDisplayer(self.ui.map_widget)
 
-        self.log_display = LogDisplayer(self.ui.log_textEdit) 
+        self.log_display = LogDisplayer(self.ui.log_textEdit)
+
+        self._init_placeholder_labels()
 
         # ── Per-channel 狀態 LED（左下,status_leds_layout 容器/.ui 定義)──
         # 每通道一組 [●LED][chN 文字]。顏色狀態機沿用 jx06 五態規則
@@ -490,6 +492,35 @@ class MainWindow(QMainWindow):
         self.hide_port_err_cb.setChecked(False)
         self.hide_port_err_cb.toggled.connect(self._on_hide_port_err_toggled)
         row.addWidget(self.hide_port_err_cb)
+
+    # ★2026-08-01：Qt Designer 的預留字。
+    #
+    # ui_main.py 裡有 11 個 QLabel 的初值是 "TextLabel"，那是 Designer 產生的
+    # 佔位符。它們【只在有遙測時】才會被覆寫，所以在還沒收到資料的機器上
+    # （或 backend 沒起來時）就一直是 "TextLabel"。
+    #
+    # 而 health_* 那四個更麻煩：唯一會設定它們的另一條路是 reset_gui_state()，
+    # 那裡把四個全部設成【綠色 OK】—— /reset-data 之後畫面說 BMP/IMU/LoRa/SD
+    # 都正常，但一筆資料都還沒進來。憑空宣稱的綠燈比 "TextLabel" 危險得多，
+    # 一併改成灰色的「—」（未知）。
+    _HEALTH_UNKNOWN_QSS = ("background-color: rgb(200, 200, 200); color: rgb(90, 90, 90); "
+                           "border-radius: 4px; padding: 2px;")
+
+    def _init_placeholder_labels(self):
+        """把 .ui 的 "TextLabel" 換成有意義的初值（資料進來前就該看得懂）"""
+        self.ui.gl_label.setText("當前偏角: --  |  最大偏角: --")
+        self.ui.map_label.setText("等待 GPS…")
+        self.ui.chart_label_1.setText("高度與速度")
+        self.ui.chart_label_2.setText("加速度")
+        self.ui.chart_label_3.setText("姿態與角速度")
+        self.ui.serial_label.setText("尚未連線")
+        for lbl, name in ((self.ui.health_bmp, "BMP"), (self.ui.health_imu, "IMU"),
+                          (self.ui.health_lora, "LoRa"), (self.ui.health_sd, "SD")):
+            lbl.setStyleSheet(self._HEALTH_UNKNOWN_QSS)
+            lbl.setText(f"{name}: —")
+        # version_label 由既有邏輯填（v1.0.5），這裡只保證不是 "TextLabel"
+        if self.ui.version_label.text() == "TextLabel":
+            self.ui.version_label.setText("")
 
     def _on_hide_port_err_toggled(self, checked: bool):
         if hasattr(self, 'log_display') and self.log_display:
@@ -972,9 +1003,13 @@ class MainWindow(QMainWindow):
             (self.ui.health_lora, "LoRa"),
             (self.ui.health_sd, "SD"),
         ]
+        # ★2026-08-01：reset 之後是【沒有資料】，不是【一切正常】。
+        # 舊碼把四個全設成綠色 OK —— /reset-data 按下去，畫面立刻宣稱
+        # BMP/IMU/LoRa/SD 都健康，而那一刻一筆遙測都還沒進來。
+        # 下一筆資料到達時 update_ui 會用真實狀態覆寫，在那之前顯示「未知」。
         for lbl, name in health_map:
-            lbl.setStyleSheet("background-color: rgb(150, 200, 150); color: black; border-radius: 4px; padding: 2px;")
-            lbl.setText(f"{name}: OK")
+            lbl.setStyleSheet(self._HEALTH_UNKNOWN_QSS)
+            lbl.setText(f"{name}: —")
 
         self.logger.info("UI state and visualization components have been completely reset.")
 

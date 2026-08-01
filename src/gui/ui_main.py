@@ -167,6 +167,12 @@ class Ui_MainWindow(object):
         self.horizontalLayout_9.setObjectName("horizontalLayout_9")
         self.label = QtWidgets.QLabel(parent=self.centralwidget)
         font = QtGui.QFont()
+        # ★2026-08-01：加後備字型。
+        # 只指定 "0xProto Nerd Font Mono" 的話，沒裝那套字型的機器會由 Qt
+        # 任意替換，字寬與行高跟著變 —— 這是「同一份程式在兩台電腦上版面
+        # 不一樣」的其中一個來源。列出後備讓兩台至少落在同一類等寬字型。
+        font.setFamilies(["0xProto Nerd Font Mono", "Consolas",
+                          "Courier New", "monospace"])
         font.setFamily("0xProto Nerd Font Mono")
         font.setPointSize(12)
         font.setBold(False)

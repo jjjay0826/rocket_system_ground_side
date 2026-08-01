@@ -31,6 +31,7 @@ SUITES = [
     ("csv",       "test_csv_storage.py",        False),  # 2026-08-01 遙測落盤
     ("labels",    "test_chart_labels.py",       False),  # 2026-08-01 圖表事件縮寫
     ("hideretry", "test_hide_retry.py",         False),  # 2026-08-01 折疊 vs 靜音
+    ("placehold", "test_no_placeholder.py",     False),  # 2026-08-01 TextLabel 預留字
 ]
 
 
