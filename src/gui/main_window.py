@@ -495,6 +495,25 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'log_display') and self.log_display:
             self.log_display.set_hide_port_errors(checked)
 
+    def _hide_retry_flight_guard(self, data):
+        """★2026-08-01：一離架就強制解除折疊。
+
+        發射台上折疊是對的（ch2 重試 331 次會把畫面洗掉），但飛行中
+        序列埠掉線是【必須立刻看到】的事 —— 那代表遙測正在消失，
+        而遙測是唯一可靠的飛行資料（SD 已實測 reset 鎖卡救不回來）。
+
+        只做一次，之後操作員仍可自行再勾起來（他要是真的想）。"""
+        if getattr(data, "stage", 0) < 1:
+            return
+        if getattr(self, "_hide_retry_released", False):
+            return
+        self._hide_retry_released = True
+        cb = getattr(self, "hide_port_err_cb", None)
+        if cb is not None and cb.isChecked():
+            cb.setChecked(False)
+            self.logger.warning("🔊 已離架 —— 自動解除「隱藏 Port 重試」，"
+                                "飛行中掉線必須看得到")
+
     @staticmethod
     def _vsep():
         sep = QLabel("┃")
@@ -1183,6 +1202,8 @@ class MainWindow(QMainWindow):
 
 
     def update_ui(self, data: SensorData):
+        self._hide_retry_flight_guard(data)
+
         has_fix = False
         if data.gnss_state:
             has_fix = "FIX" in data.gnss_state.upper() and "NO_FIX" not in data.gnss_state.upper()

@@ -39,14 +39,37 @@ class LogDisplayer:
         # 5000 行在 1.5 行/秒下是約 55 分鐘的回溯，遠超過任何一次要往回翻的
         # 距離；而真正要查的完整紀錄在 raw log 與 CSV 裡，不靠這個視窗。
         self.log_widget.document().setMaximumBlockCount(5000)
+        # ★2026-08-01：這個功能的取捨。
+        #
+        # jx06T 加的原版是【直接丟掉】符合關鍵字的訊息。抑制洗版是對的 ——
+        # ch2 的 com14 已經重試 331 次、把其他訊息全埋掉。
+        # 但「丟掉」讓埠真的死掉時完全無聲，而那正是最需要知道的時刻。
+        #
+        # 改成【折疊】：
+        #   · 第一則永遠顯示 —— 你要知道它【什麼時候】開始出問題
+        #   · 之後的收起來，但每 60 秒吐一行摘要（第幾次、已經多久）
+        #   · 恢復連線時也講一聲
+        # 這樣既不洗版，也不會安靜。「沒有新訊息」和「一直在重試」
+        # 在畫面上永遠分得出來。
         self.hide_port_errors = False
+        self._retry_n = 0            # 本輪已折疊幾則
+        self._retry_t0 = None        # 本輪第一則的時間
+        self._retry_last = 0.0       # 上次吐摘要的時間
         self.emitter = LogSignalEmitter()
         self.emitter.log_received.connect(self._append_log)
         self.setup_logging()
 
+    _RETRY_SUMMARY_S = 60.0      # 折疊時每隔多久吐一行摘要
+
     def set_hide_port_errors(self, enabled: bool):
-        """設定是否隱藏串列埠連線失敗與重試日誌"""
+        """設定是否折疊串列埠連線失敗與重試日誌（不是丟掉，見 __init__）"""
+        if not enabled and self._retry_n:
+            self._append_log(f"🔊 序列埠重試 log 恢復顯示"
+                             f"（折疊期間共 {self._retry_n} 則）")
         self.hide_port_errors = enabled
+        self._retry_n = 0
+        self._retry_t0 = None
+        self._retry_last = 0.0
 
     def _is_port_retry_log(self, msg: str) -> bool:
         """判斷訊息是否為串列埠連線失敗或重試的日誌"""
@@ -103,7 +126,24 @@ class LogDisplayer:
 
     def _append_log(self, msg: str):
         if self.hide_port_errors and self._is_port_retry_log(msg):
-            return
+            import time as _t
+            now = _t.time()
+            if self._retry_t0 is None:
+                # 第一則一定要看得到 —— 這是「什麼時候開始壞的」
+                self._retry_t0 = now
+                self._retry_last = now
+                self._retry_n = 1
+            else:
+                self._retry_n += 1
+                if now - self._retry_last >= self._RETRY_SUMMARY_S:
+                    self._retry_last = now
+                    mins = (now - self._retry_t0) / 60.0
+                    self._append_log(
+                        f"🔇 序列埠仍在重試（已折疊 {self._retry_n} 則，"
+                        f"持續 {mins:.1f} 分鐘）—— 取消勾選可展開")
+                return          # 折疊，但上面那行摘要已經出去了
+        elif self._retry_t0 is not None and not self._is_port_retry_log(msg):
+            pass                # 有其他訊息不代表重試停了，計數繼續
         html_formatted = self._format_html_log(msg)
         self.log_widget.append(html_formatted)
         self.log_widget.moveCursor(QTextCursor.MoveOperation.End)

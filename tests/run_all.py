@@ -30,6 +30,7 @@ SUITES = [
     ("axis",      "test_axis_mapping.py",       False),  # 2026-07-31 航電板改豎放
     ("csv",       "test_csv_storage.py",        False),  # 2026-08-01 遙測落盤
     ("labels",    "test_chart_labels.py",       False),  # 2026-08-01 圖表事件縮寫
+    ("hideretry", "test_hide_retry.py",         False),  # 2026-08-01 折疊 vs 靜音
 ]
 
 
