@@ -39,10 +39,25 @@ class LogDisplayer:
         # 5000 行在 1.5 行/秒下是約 55 分鐘的回溯，遠超過任何一次要往回翻的
         # 距離；而真正要查的完整紀錄在 raw log 與 CSV 裡，不靠這個視窗。
         self.log_widget.document().setMaximumBlockCount(5000)
-
+        self.hide_port_errors = False
         self.emitter = LogSignalEmitter()
         self.emitter.log_received.connect(self._append_log)
         self.setup_logging()
+
+    def set_hide_port_errors(self, enabled: bool):
+        """設定是否隱藏串列埠連線失敗與重試日誌"""
+        self.hide_port_errors = enabled
+
+    def _is_port_retry_log(self, msg: str) -> bool:
+        """判斷訊息是否為串列埠連線失敗或重試的日誌"""
+        retry_keywords = [
+            "無法連線到 port",
+            "Retrying...",
+            "is offline. Attempting to connect",
+            "connection lost! Starting reconnection loop",
+            "Serial connection is not active. Initiating connection"
+        ]
+        return any(kw in msg for kw in retry_keywords)
     
     def _format_html_log(self, msg: str) -> str:
         """將純文字 log 轉換為高對比度、高可讀性的富文本 HTML 格式"""
@@ -87,6 +102,8 @@ class LogDisplayer:
             return f'<span style="color: {body_color}; font-family: consolas, monospace;">{escaped_msg}</span>'
 
     def _append_log(self, msg: str):
+        if self.hide_port_errors and self._is_port_retry_log(msg):
+            return
         html_formatted = self._format_html_log(msg)
         self.log_widget.append(html_formatted)
         self.log_widget.moveCursor(QTextCursor.MoveOperation.End)
