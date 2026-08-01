@@ -1202,8 +1202,6 @@ class MainWindow(QMainWindow):
 
 
     def update_ui(self, data: SensorData):
-        self._hide_retry_flight_guard(data)
-
         has_fix = False
         if data.gnss_state:
             has_fix = "FIX" in data.gnss_state.upper() and "NO_FIX" not in data.gnss_state.upper()
@@ -1443,6 +1441,13 @@ class MainWindow(QMainWindow):
         # ★prev_stage is None(該頻道第一筆)不觸發:GUI 中途啟動時火箭可能
         #   早就開傘了,那不構成「剛剛送出的指令被收到」的證據。
         # (火箭現行 5 態;st.md 12 態上機後此對映要改——12 態的 2=上升段)
+        # ★2026-08-01：折疊解除的守衛必須在【焦點分發之前】。
+        # 放在 update_ui 裡是錯的 —— 那個函式只對焦點頻道跑，而操作員
+        # 會去勾這個框，正是因為某個頻道在洗版；如果焦點就停在那個
+        # 掛掉的頻道上，它一幀都不會進來，解除永遠不觸發。
+        # 掛在這裡則是【任一頻道】離架就解除，符合「同一枚火箭」的事實。
+        self._hide_retry_flight_guard(data)
+
         prev_stage = self.ch_prev_stage.get(topic)
         self.ch_prev_stage[topic] = data.stage
         if prev_stage is not None and data.stage in (2, 3) and prev_stage not in (2, 3):

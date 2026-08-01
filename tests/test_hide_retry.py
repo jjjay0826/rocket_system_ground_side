@@ -93,6 +93,34 @@ def run():
         c.check("解除只做一次，之後不再強制",
                 w.hide_port_err_cb.isChecked(),
                 "操作員自己再勾起來就尊重他的決定")
+
+        # ── ⑧ ★守衛必須掛在【焦點分發之前】───────────────────────
+        # update_ui 只對焦點頻道跑。而操作員會去勾這個框，正是因為某個
+        # 頻道在洗版 —— 如果焦點就停在那個掛掉的頻道上，它一幀都不會
+        # 進來，解除永遠不會觸發。掛在 update_ui_from_zmq 才是對的。
+        import inspect
+        src_zmq = inspect.getsource(w.update_ui_from_zmq)
+        src_ui = inspect.getsource(w.update_ui)
+        c.check("★守衛在 update_ui_from_zmq（每個頻道都會經過）",
+                "_hide_retry_flight_guard" in src_zmq,
+                "放在 update_ui 的話，焦點停在死掉的頻道上就永遠不解除")
+        c.check("守衛不在 update_ui（那裡只有焦點頻道）",
+                "_hide_retry_flight_guard" not in src_ui)
+        i_guard = src_zmq.index("_hide_retry_flight_guard")
+        i_focus = src_zmq.index("self.focus_channel")
+        c.check("★守衛在焦點分發【之前】", i_guard < i_focus,
+                f"guard@{i_guard} focus@{i_focus}")
+
+        # 非焦點頻道離架也要能解除
+        w._hide_retry_released = False
+        w.hide_port_err_cb.setChecked(True)
+        other = [ch for ch in w.channel_ids if ch != w.focus_channel]
+        if other:
+            w.update_ui_from_zmq(other[0],
+                                 SensorData.from_new_format(frame(t=4, sq=4, st=1)))
+            c.check(f"★非焦點頻道（{other[0]}）離架也解除",
+                    not w.hide_port_err_cb.isChecked(),
+                    "兩塊板在同一枚火箭上，任一塊離架就是離架")
     finally:
         ld.log_widget.append = real_append
         ld.set_hide_port_errors(False)
