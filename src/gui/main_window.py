@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QCheckBox,
 from PyQt6.QtQuick import QQuickWindow, QSGRendererInterface
 from PyQt6.QtCore import QTimer
 
-from src.gui.ui_main import Ui_MainWindow  
+from src import __version__
+from src.gui.ui_main import Ui_MainWindow
 from src.gui.qt_observer import QtGuiObserver
 from src.gui.visualizers.line_chart import LineChartDrawer
 from src.gui.flow_layout import FlowLayout
@@ -522,7 +523,7 @@ class MainWindow(QMainWindow):
                           (self.ui.health_lora, "LoRa"), (self.ui.health_sd, "SD")):
             lbl.setStyleSheet(self._HEALTH_UNKNOWN_QSS)
             lbl.setText(f"{name}: —")
-        # version_label 由既有邏輯填（v1.0.5），這裡只保證不是 "TextLabel"
+        # version_label 由 init_gui() 從 src.__version__ 填，這裡只保證不是 "TextLabel"
         if self.ui.version_label.text() == "TextLabel":
             self.ui.version_label.setText("")
 
@@ -1046,7 +1047,9 @@ class MainWindow(QMainWindow):
             layout.insertWidget(insert_pos + i, cb)
 
     def init_gui(self):
-        self.ui.version_label.setText("v1.0.5")
+        # 版本號的單一來源在 src/__init__.py —— 先前這裡寫死 "v1.0.5"，
+        # 那是 micro:bit 原型時代的編號，實際版本早已是 v3.x（見該檔說明）。
+        self.ui.version_label.setText(f"v{__version__}")
         cfg = self.channel_configs.get(self.focus_channel, {})
         port = cfg.get("port", "N/A")
         baud = cfg.get("baud", "N/A")
